@@ -1,0 +1,10 @@
+# Top-level runtime dependencies (approved list). Exact pins live in requirements.txt.
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+psycopg[binary,pool]
+aio-pika
+redis
+cryptography
+python-json-logger

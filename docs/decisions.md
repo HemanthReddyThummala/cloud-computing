@@ -38,10 +38,20 @@ why, and what it does **not** guarantee.
 - **Explicit note:** the encrypted token **is temporarily persisted by the RabbitMQ broker** (durable
   queue on the broker's disk) until the job reaches a terminal state or the queue expires
   (`CREDENTIAL_TTL_HOURS`, default 24). It is *not* true that the token is stored nowhere.
-- Workers read the credential with `basic.get` + `nack(requeue=true)` (non-consuming read), so worker
-  crashes and retries never lose it. The mailbox is deleted when the job reaches
+- Workers read the credential with `basic.get` (manual ack) + `nack(requeue=true)` on the SAME message
+  (non-consuming read; nothing is republished), so worker crashes and retries never lose it and the
+  message keeps its original TTL (verified: repeated reads do not extend it).
+- A crash between `get` and `nack` leaves the message unacked until RabbitMQ notices the dead connection
+  (immediate for a killed local process; up to the AMQP heartbeat timeout for a network partition). A
+  reader that finds the mailbox queue present but empty therefore waits, bounded by
+  `CREDENTIAL_READ_WAIT_SEC` (default 90 s), instead of failing; a missing queue fails immediately.
+  Normally only the one worker holding the job's advisory lock reads a job's mailbox. The mailbox is deleted when the job reaches
   COMPLETED / COMPLETED_WITH_WARNINGS / FAILED / DEAD_LETTERED.
 - Missing or expired mailbox → job FAILED with `NOTION_CREDENTIALS_UNAVAILABLE` (resubmit).
+- TTL semantics (verified in Phase 1): the **message** expires `CREDENTIAL_TTL_HOURS` after submission
+  (absolute bound). The **queue** expires after being *unused* for that long; any `queue.declare`
+  (including passive) or `basic.get` by a worker resets the queue's idle timer. An emptied queue left
+  behind after the message expired is harmless, holds no secret, and is removed by `x-expires`.
 - Tokens are never logged or echoed in error responses (log redaction filter + fixed error codes).
 
 ## ADR-04 Idempotency keys for `POST /jobs`
@@ -66,6 +76,23 @@ why, and what it does **not** guarantee.
   state transitions; messages for terminal jobs are acknowledged and dropped.
 - Bounded retries: `MAX_ATTEMPTS`, `BACKOFF_SCHEDULE_SEC` (+ jitter) via TTL delay queues; exhausted →
   DEAD_LETTERED + `jobs.dlq`. Quorum `x-delivery-limit` as a backstop against messages that crash every worker.
+- The broker image is pinned to `rabbitmq:4.4.1-management` (same digest as the image the tests ran
+  against), because the semantics below are version-dependent. Re-run the suite before changing it.
+- Verified broker semantics (RabbitMQ 4.4.1, quorum queues, Phase 1 review):
+  - a consumer crash / closed channel **does** increment `x-delivery-count`, so `x-delivery-limit`
+    bounds crash loops (message then dead-lettered with reason `delivery_limit`);
+  - an explicit `nack(requeue=true)` does **not** increment it, so it can NOT bound explicit requeues.
+    Therefore the worker never relies on nack-requeue for retries: unexpected errors are counted in the
+    `x-processing-attempts` header (republish confirmed copy, then ack) and after `QUEUE_DELIVERY_LIMIT`
+    attempts the message is rejected (`requeue=false`) → dead-lettered with reason `rejected`.
+    (Interim Phase 1 behaviour; Phase 2 replaces it with classified errors + exponential backoff.)
+  - lock-busy duplicate deferrals republish a new message and therefore never consume attempts.
+- **Phase 2 REQUIREMENT (not done in Phase 1):** when a message reaches `jobs.dlq`, PostgreSQL is NOT
+  updated — the job stays in its last non-terminal status forever. Phase 2 must set `DEAD_LETTERED`
+  (with an `error`), delete the credential mailbox, and use at-least-once dead-lettering. A strict
+  `xfail` test (`test_phase2_requirement_dead_lettered_job_state`) tracks this gap.
+- Result integrity (migration 002 + worker validation): only COMPLETED/COMPLETED_WITH_WARNINGS carry a
+  `result`, which must hold an https Notion URL and frame counts; only FAILED/DEAD_LETTERED carry `error`.
 - **Real orchestration only.** No simulated stages or fake progress in product code. Stages not yet
   implemented make a job end FAILED with `PIPELINE_STAGE_UNAVAILABLE`. Crash and redelivery behaviour is
   proven with pytest fixtures against real RabbitMQ / PostgreSQL containers.

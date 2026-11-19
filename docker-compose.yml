@@ -1,0 +1,199 @@
+# Distributed Multimodal Video Note-Taking Agent — local stack.
+#   docker compose up -d --build                 # gateway, outbox publisher, 2 workers + infra
+#   docker compose up -d --scale worker=3        # scale workers
+#   docker compose --profile test run --rm tests # integration tests (isolated DB / vhost / Redis db)
+# All values come from .env (never committed). Scalable services have no container_name.
+name: notes-agent
+
+x-backend: &backend
+  build:
+    context: ./backend
+    target: runtime
+  image: notes-agent-backend:dev
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    rabbitmq:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "max_connections=80"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEM_LIMIT:-512m}
+
+  rabbitmq:
+    # Pinned to the exact version whose semantics were verified by the integration tests
+    # (delivery-count behaviour differs between RabbitMQ releases — see ADR-05).
+    image: rabbitmq:4.4.1-management
+    hostname: rabbitmq          # stable node name => durable data survives restarts
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+      - ./backend/infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/20-notes-agent.conf:ro
+    ports:
+      - "127.0.0.1:15672:15672"   # management UI (localhost only)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${RABBITMQ_MEM_LIMIT:-512m}
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "${REDIS_MAXMEMORY:-96mb}",
+              "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEM_LIMIT:-128m}
+
+  migrate:
+    build:
+      context: ./backend
+      target: runtime
+    image: notes-agent-backend:dev
+    command: ["python", "-m", "notesagent.common.migrate"]
+    restart: "no"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway:
+    <<: *backend
+    command: ["python", "-m", "notesagent.gateway"]
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      REDIS_URL: ${REDIS_URL}
+      JOB_PAYLOAD_ENCRYPTION_KEY: ${JOB_PAYLOAD_ENCRYPTION_KEY}
+      CREDENTIAL_TTL_HOURS: ${CREDENTIAL_TTL_HOURS:-24}
+      IDEMPOTENCY_KEY_TTL_HOURS: ${IDEMPOTENCY_KEY_TTL_HOURS:-24}
+      QUEUE_DELIVERY_LIMIT: ${QUEUE_DELIVERY_LIMIT:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${GATEWAY_MEM_LIMIT:-256m}
+
+  outbox-publisher:
+    <<: *backend
+    command: ["python", "-m", "notesagent.outbox"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      QUEUE_DELIVERY_LIMIT: ${QUEUE_DELIVERY_LIMIT:-10}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/outbox-heartbeat') < 60 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: ${OUTBOX_MEM_LIMIT:-192m}
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "notesagent.worker"]
+    stop_grace_period: 15s
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      REDIS_URL: ${REDIS_URL}
+      JOB_PAYLOAD_ENCRYPTION_KEY: ${JOB_PAYLOAD_ENCRYPTION_KEY}
+      CREDENTIAL_READ_WAIT_SEC: ${CREDENTIAL_READ_WAIT_SEC:-90}
+      QUEUE_DELIVERY_LIMIT: ${QUEUE_DELIVERY_LIMIT:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/worker-heartbeat') < 30 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+      resources:
+        limits:
+          memory: ${WORKER_MEM_LIMIT:-768m}
+
+  # Integration tests: same code, test-only dependencies, isolated database (notes_test),
+  # RabbitMQ vhost (notes_test) and Redis db 15. Uses its own throwaway encryption key.
+  tests:
+    profiles: ["test"]
+    build:
+      context: ./backend
+      target: test
+    image: notes-agent-backend:test
+    environment:
+      TEST_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/notes_test
+      TEST_ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      TEST_RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/notes_test
+      TEST_RABBITMQ_MGMT_URL: http://rabbitmq:15672
+      TEST_RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER}
+      TEST_RABBITMQ_PASS: ${RABBITMQ_DEFAULT_PASS}
+      TEST_REDIS_URL: redis://redis:6379/15
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+volumes:
+  pgdata:
+  rabbitmqdata:
+  redisdata:
