@@ -66,4 +66,4 @@ def test_two_workers_never_process_the_same_job_simultaneously(api, db, procs, f
     for stage in ("TRANSCRIBING", "SUMMARIZING", "EXTRACTING_FRAMES", "PUBLISHING"):
         assert run_count(fx, job_id, stage) == 1, stage
     assert [e["event_type"] for e in events(db, job_id)].count("claimed") == 1
-    wait_until(lambda: queue_state("jobs.work").messages == 0, timeout=15, what="duplicate drained")
+    wait_until(lambda: queue_state("jobs.work.v2").messages == 0, timeout=15, what="duplicate drained")

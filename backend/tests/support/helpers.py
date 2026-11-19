@@ -19,7 +19,7 @@ from notesagent.outbox.publisher import OutboxPublisher
 
 VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 VIDEO_ID = "dQw4w9WgXcQ"
-TABLES = ("jobs", "job_events", "job_checkpoints", "outbox", "idempotency_keys")
+TABLES = ("jobs", "job_events", "job_checkpoints", "outbox", "idempotency_keys", "dead_letter_audit")
 
 
 def new_token() -> str:

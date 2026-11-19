@@ -18,6 +18,9 @@ _REDACTIONS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(secret_|ntn_|nrt_)[A-Za-z0-9_\-]+"), r"\1[REDACTED]"),
     # Passwords inside connection strings
     (re.compile(r"(?i)\b((?:amqps?|postgres(?:ql)?|rediss?)://[^:/@\s]*:)[^@\s]+@"), r"\1[REDACTED]@"),
+    # Google API keys, and any key=... URL query parameter (Gemini sends keys this way)
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "[REDACTED-GOOGLE-KEY]"),
+    (re.compile(r"([?&]key=)[^&\s\"'#]+"), r"\1[REDACTED]"),
     # Fernet ciphertext (credential mailbox payloads)
     (re.compile(r"\bgAAAAA[A-Za-z0-9_\-]{20,}={0,2}"), "[REDACTED-CIPHERTEXT]"),
 ]

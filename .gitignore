@@ -45,6 +45,7 @@ tmp/
 *.webm
 *.mkv
 frames_tmp/
+backend/test-artifacts/
 
 # ---------------------------------------------------------------
 # Node / extension packaging

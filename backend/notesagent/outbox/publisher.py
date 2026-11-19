@@ -21,7 +21,7 @@ from typing import Any
 
 import psycopg
 
-from notesagent.common.broker import BrokerClient
+from notesagent.common.broker import HEADER_EVENT_TYPE, BrokerClient
 from notesagent.common.config import Settings
 from notesagent.common.db import open_pool
 from notesagent.common.jobs_repo import OUTBOX_NOTIFY_CHANNEL
@@ -59,14 +59,17 @@ class OutboxPublisher:
             try:
                 async with conn.transaction():
                     cur = await conn.execute(
-                        "SELECT id, event_id, job_id, event_type, payload FROM outbox"
+                        "SELECT id, event_id, job_id, event_type, payload, destination_exchange,"
+                        " destination_routing_key FROM outbox"
                         " WHERE published_at IS NULL ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED")
                     row = await cur.fetchone()
                     if row is None:
                         return False
-                    await self.broker.publish_job_event(
+                    await self.broker.publish_to(
+                        row["destination_exchange"], row["destination_routing_key"],
                         event_id=row["event_id"], job_id=row["job_id"],
-                        body=json.dumps(row["payload"]).encode("utf-8"))
+                        body=json.dumps(row["payload"]).encode("utf-8"),
+                        headers={HEADER_EVENT_TYPE: row["event_type"]})   # ADR-12 origin marker
                     # --- the broker has confirmed the message at this point ---
                     if self._after_confirm:
                         self._after_confirm(row)
@@ -80,7 +83,9 @@ class OutboxPublisher:
                             "UPDATE outbox SET publish_attempts = publish_attempts + 1, last_error = %s"
                             " WHERE id = %s AND published_at IS NULL", (type(exc).__name__, row["id"]))
                 raise
-        log.info("outbox event published", extra={"event_id": str(row["event_id"]), "job_id": str(row["job_id"])})
+        log.info("outbox event published", extra={"event_id": str(row["event_id"]), "job_id": str(row["job_id"]),
+                                                  "exchange": row["destination_exchange"],
+                                                  "routing_key": row["destination_routing_key"]})
         return True
 
     async def drain(self, limit: int = 100) -> int:

@@ -36,6 +36,9 @@ class StageContext:
     checkpoints: dict[str, dict[str, Any]]                     # outputs of earlier stages
     worker_id: str
     _credential_reader: Callable[[], Awaitable[str]]
+    # Shared rate limiter (ADR-13). Every external call must first obtain a permit:
+    #   await ctx.limiter.acquire(Provider.GEMINI, tokens=...)
+    limiter: Any = None
 
     async def get_notion_token(self) -> str:
         """Decrypt the token from the credential mailbox (non-consuming read)."""

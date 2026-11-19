@@ -11,6 +11,7 @@ from psycopg_pool import PoolTimeout
 from notesagent.common import jobs_repo, states
 from notesagent.common.errors import ApiError
 from notesagent.gateway.health import check_health
+from notesagent.worker.retry_policy import public_retry_view
 from notesagent.gateway.validation import (
     parse_job_id,
     parse_submit_request,
@@ -36,7 +37,7 @@ def job_status_view(row: dict[str, Any]) -> dict[str, Any]:
         "warnings": row["warnings"],
         "error": row["error"],
         "result": row["result"],
-        "retry": row["retry"],
+        "retry": public_retry_view(row["retry"]),     # no event_id / budget / internals
         "created_at": _iso(row["created_at"]),
         "updated_at": _iso(row["updated_at"]),
     }

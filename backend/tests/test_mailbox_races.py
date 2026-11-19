@@ -60,14 +60,52 @@ def test_worker_waits_for_credential_held_by_crashed_peer(api, db, procs, fx):
 def test_missing_mailbox_fails_immediately(api, db, procs, fx, rabbit_admin):
     job_id = submit_ok(api)
     asyncio.run(_delete_mailbox(job_id))
+    mailbox_listed_after_delete = f"cred.{job_id}" in rabbit_admin.queue_names()
     drain_outbox()
     started = time.monotonic()
-    procs.start("worker-a", "tests.support.run_fixture_worker", FIXTURE_DIR=fx,
-                FIXTURE_TOKEN_STAGE="TRANSCRIBING", CREDENTIAL_READ_WAIT_SEC=60)
-    row = wait_for_status(db, job_id, {"FAILED", "COMPLETED"}, timeout=30)
-    assert row["status"] == "FAILED" and row["error"]["code"] == "NOTION_CREDENTIALS_UNAVAILABLE"
-    assert row["result"] is None
-    assert time.monotonic() - started < 20                       # did not wait the 60 s
+    worker = procs.start("worker-a", "tests.support.run_fixture_worker", FIXTURE_DIR=fx,
+                         FIXTURE_TOKEN_STAGE="TRANSCRIBING", CREDENTIAL_READ_WAIT_SEC=60)
+
+    # DIAGNOSTICS ONLY: same 30 s / 0.1 s polling as wait_for_status, plus recorded milestones.
+    milestones: dict[str, float] = {}
+    row, last_status = None, None
+    while time.monotonic() - started < 30:
+        now = time.monotonic() - started
+        if "worker_started" not in milestones and "worker started" in procs.log("worker-a"):
+            milestones["worker_started"] = now
+        current = job(db, job_id)
+        if current and current["status"] != last_status:
+            last_status = current["status"]
+            milestones[f"status_{last_status}"] = now
+        if current and current["status"] in {"FAILED", "COMPLETED"}:
+            row = current
+            break
+        time.sleep(0.1)
+    elapsed = time.monotonic() - started
+
+    def diagnostics() -> str:
+        events = db.execute("SELECT event_type, from_status, to_status, worker_id, created_at FROM job_events"
+                            " WHERE job_id = %s ORDER BY id", (job_id,)).fetchall()
+        t0 = events[0]["created_at"] if events else None
+        timeline = [f"{e['event_type']}:{e['from_status']}->{e['to_status']}@+"
+                    f"{(e['created_at'] - t0).total_seconds():.2f}s" for e in events]
+        outbox = db.execute("SELECT published_at IS NOT NULL AS published, publish_attempts FROM outbox"
+                            " WHERE job_id = %s", (job_id,)).fetchone()
+        tail = [line[:300] for line in procs.log("worker-a").splitlines()[-20:]]
+        return (f"\nDIAG elapsed={elapsed:.2f}s milestones={ {k: round(v, 2) for k, v in milestones.items()} }"
+                f"\nDIAG row={ {k: (row or {}).get(k) for k in ('status', 'error', 'result')} }"
+                f"\nDIAG events={timeline}\nDIAG outbox={outbox} worker_returncode={worker.poll()}"
+                f"\nDIAG mailbox_listed_after_delete={mailbox_listed_after_delete} "
+                f"mailbox_listed_now={f'cred.{job_id}' in rabbit_admin.queue_names()}"
+                f"\nDIAG worker_log_tail=\n  " + "\n  ".join(tail))
+
+    print(f"\nEVIDENCE missing-mailbox timing: elapsed={elapsed:.2f}s "
+          f"milestones={ {k: round(v, 2) for k, v in milestones.items()} }")
+    assert row is not None, "job did not reach FAILED/COMPLETED within 30 s" + diagnostics()
+    # Original assertions, unchanged in condition and order:
+    assert row["status"] == "FAILED" and row["error"]["code"] == "NOTION_CREDENTIALS_UNAVAILABLE", diagnostics()
+    assert row["result"] is None, diagnostics()
+    assert time.monotonic() - started < 20, diagnostics()        # did not wait the 60 s
 
 
 def test_mailbox_without_message_fails_after_bounded_wait(api, db, procs, fx):

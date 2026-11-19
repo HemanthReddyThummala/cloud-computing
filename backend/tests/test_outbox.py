@@ -34,7 +34,7 @@ def test_publisher_marks_event_published_after_confirm(api, db):
     row = _outbox(db, job_id)
     assert row["published_at"] is not None and row["publish_attempts"] == 1 and row["last_error"] is None
 
-    [msg] = peek_messages("jobs.work")
+    [msg] = peek_messages("jobs.work.v2")
     assert msg.message_id == str(row["event_id"])
     assert msg.delivery_mode == 2  # persistent
     assert json.loads(msg.body)["job_id"] == job_id
@@ -59,7 +59,7 @@ def test_publish_failure_keeps_event_pending(api, db):
     row = _outbox(db, job_id)
     assert row["published_at"] is None and row["publish_attempts"] == 1
     assert row["last_error"] == "BrokerUnavailable"
-    assert queue_state("jobs.work").messages == 0
+    assert queue_state("jobs.work.v2").messages == 0
 
     assert drain_outbox() == 1                              # recovers once the broker is back
     assert _outbox(db, job_id)["published_at"] is not None
@@ -72,10 +72,10 @@ def test_crash_after_confirm_duplicates_message_but_job_runs_once(api, db, procs
 
     row = _outbox(db, job_id)
     assert row["published_at"] is None                      # DB never learned it was published
-    assert queue_state("jobs.work").messages == 1           # ...but the broker has the message
+    assert queue_state("jobs.work.v2").messages == 1           # ...but the broker has the message
 
     assert drain_outbox() == 1                              # restarted publisher sends it again
-    copies = peek_messages("jobs.work")
+    copies = peek_messages("jobs.work.v2")
     assert len(copies) == 2 and {m.message_id for m in copies} == {str(row["event_id"])}
 
     procs.start("w1", "tests.support.run_fixture_worker", FIXTURE_DIR=fx)
@@ -83,7 +83,7 @@ def test_crash_after_confirm_duplicates_message_but_job_runs_once(api, db, procs
     for stage in ("TRANSCRIBING", "SUMMARIZING", "EXTRACTING_FRAMES", "PUBLISHING"):
         assert run_count(fx, job_id, stage) == 1, stage     # consumer idempotency: no double work
     assert [e["event_type"] for e in events(db, job_id)].count("claimed") == 1
-    wait_until(lambda: queue_state("jobs.work").messages == 0, timeout=15, what="duplicate acknowledged")
+    wait_until(lambda: queue_state("jobs.work.v2").messages == 0, timeout=15, what="duplicate acknowledged")
     procs.wait_for_log("w1", "duplicate message for finished job dropped")
 
 
@@ -94,4 +94,4 @@ def test_publisher_service_wakes_on_notify(api, db, procs):
     time.sleep(2)                                           # let LISTEN be established
     job_id = submit_ok(api)
     wait_until(lambda: _outbox(db, job_id)["published_at"] is not None, timeout=10, what="published via NOTIFY")
-    assert queue_state("jobs.work").messages == 1
+    assert queue_state("jobs.work.v2").messages == 1

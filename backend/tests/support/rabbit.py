@@ -119,5 +119,45 @@ def publish_job_message(job_id: str, event_id: str | None = None) -> None:
     asyncio.run(_publish(body, event_id, job_id))
 
 
-def publish_raw(body: bytes) -> None:
-    asyncio.run(_publish(body, str(uuid.uuid4()), "unknown"))
+def publish_raw(body: bytes, job_id: str = "unknown") -> None:
+    asyncio.run(_publish(body, str(uuid.uuid4()), job_id))
+
+
+async def _publish_to_dlx(body: bytes, message_id: str | None, headers: dict) -> None:
+    conn = await aio_pika.connect(os.environ["TEST_RABBITMQ_URL"])
+    try:
+        ch = await conn.channel(publisher_confirms=True)
+        ex = await ch.get_exchange("jobs.dlx", ensure=True)
+        await ex.publish(Message(body, delivery_mode=DeliveryMode.PERSISTENT, message_id=message_id,
+                                 content_type="application/json", headers=headers), routing_key="")
+    finally:
+        await conn.close()
+
+
+def publish_dead_letter(body: bytes, message_id: str | None, headers: dict) -> None:
+    """Publish into jobs.dlx (fanout -> jobs.dlq + jobs.dlq.audit) with crafted, broker-like headers.
+
+    aiormq (under aio-pika) always assigns a random message_id when none is set (verified), so a
+    message WITHOUT message_id is published through the management HTTP API, which adds none."""
+    if message_id is None:
+        admin = RabbitAdmin()
+        resp = admin.client.post(f"/api/exchanges/{VHOST}/jobs.dlx/publish", json={
+            "routing_key": "", "payload": body.decode(), "payload_encoding": "string",
+            "properties": {"delivery_mode": 2, "content_type": "application/json", "headers": headers}})
+        resp.raise_for_status()
+        assert resp.json() == {"routed": True}
+        return
+    asyncio.run(_publish_to_dlx(body, message_id, headers))
+
+
+def broker_death_headers(job_id: str, reason: str = "delivery_limit", queue: str = "jobs.work.v2",
+                         earlier: list[dict] | None = None) -> dict:
+    """Header layout RabbitMQ 4.4.1 produces for a dead letter (captured in the broker probe):
+    x-death newest first, x-last-death-* = newest, x-first-death-* = oldest."""
+    newest = {"count": 1, "reason": reason, "queue": queue, "exchange": "jobs", "routing-keys": ["job.work"]}
+    deaths = [newest, *(earlier or [])]
+    oldest = deaths[-1]
+    return {"x-job-id": job_id, "x-event-type": "job.submitted", "x-death": deaths, "x-delivery-count": 11,
+            "x-last-death-reason": reason, "x-last-death-queue": queue, "x-last-death-exchange": "jobs",
+            "x-first-death-reason": oldest["reason"], "x-first-death-queue": oldest["queue"],
+            "x-first-death-exchange": oldest["exchange"]}

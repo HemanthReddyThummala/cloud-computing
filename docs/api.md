@@ -61,7 +61,18 @@ mailbox; it is never stored in PostgreSQL (ADR-03).
 ```
 
 Spec fields: `job_id, status, progress, video_title, duration_sec, warnings, error, result`.
-Additive fields: `video_id, retry` (Phase 2: populated while waiting for a backoff retry), `created_at, updated_at`.
+Additive fields: `video_id`, `retry`, `created_at`, `updated_at`.
+
+`retry` is `null` unless the job is waiting for a scheduled retry. Then the status stays at the
+current stage (the job is waiting, not failed) and:
+
+```json
+"retry": { "reason": "NOTION_RATE_LIMITED", "attempt": 1, "max_attempts": 5,
+           "next_attempt_at": "2026-11-19T05:31:10+00:00" }
+```
+
+`attempt` = failed attempts so far; `max_attempts` = total executions allowed. Internal retry fields
+(event id, budget) are never exposed.
 Unknown or malformed id → **404** `JOB_NOT_FOUND`. Polling never modifies the job (tested).
 
 ---
@@ -98,12 +109,27 @@ Unknown or malformed id → **404** `JOB_NOT_FOUND`. Polling never modifies the 
   "error": { "code": "VIDEO_TOO_LONG", "message": "..." } }
 ```
 
-**DEAD_LETTERED → 200** (same shape as FAILED; produced from Phase 2 onwards)
+**DEAD_LETTERED → 200** (a *retryable* failure exhausted its retry budget; same shape as FAILED)
 
 ```json
 { "status": "DEAD_LETTERED", "result": null, "warnings": [],
-  "error": { "code": "RETRIES_EXHAUSTED", "message": "..." } }
+  "error": { "code": "RETRIES_EXHAUSTED", "message": "...", "last_error_code": "GEMINI_QUOTA_EXHAUSTED",
+             "attempts": 5, "resets_at": "2026-11-20T00:00:00-08:00" } }
 ```
+
+`last_error_code` is the classified cause of the final failure; `resets_at` appears only when that cause
+was a daily quota (absolute time, not capped).
+
+**DEAD_LETTERED by the broker → 200** (RabbitMQ dead-lettered the job message itself: processing it
+repeatedly crashed the workers, or the message was unreadable; ADR-12)
+
+```json
+{ "status": "DEAD_LETTERED", "result": null, "warnings": [],
+  "error": { "code": "DEAD_LETTERED_BY_BROKER", "message": "...", "reason": "delivery_limit" } }
+```
+
+`reason` is `delivery_limit` or `rejected`. A dead letter whose broker metadata is missing or
+inconsistent never changes the job; it is only recorded for inspection.
 
 Guarantees (enforced by the worker **and** by PostgreSQL constraints, migration 002):
 

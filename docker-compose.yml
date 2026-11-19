@@ -109,6 +109,9 @@ services:
       CREDENTIAL_TTL_HOURS: ${CREDENTIAL_TTL_HOURS:-24}
       IDEMPOTENCY_KEY_TTL_HOURS: ${IDEMPOTENCY_KEY_TTL_HOURS:-24}
       QUEUE_DELIVERY_LIMIT: ${QUEUE_DELIVERY_LIMIT:-10}
+      BACKOFF_SCHEDULE_SEC: ${BACKOFF_SCHEDULE_SEC:-10,30,90}
+      LOCK_RETRY_DELAY_SEC: ${LOCK_RETRY_DELAY_SEC:-5}
+      INFRA_RETRY_DELAY_SEC: ${INFRA_RETRY_DELAY_SEC:-30}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=3)"]
@@ -128,6 +131,9 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       RABBITMQ_URL: ${RABBITMQ_URL}
       QUEUE_DELIVERY_LIMIT: ${QUEUE_DELIVERY_LIMIT:-10}
+      BACKOFF_SCHEDULE_SEC: ${BACKOFF_SCHEDULE_SEC:-10,30,90}
+      LOCK_RETRY_DELAY_SEC: ${LOCK_RETRY_DELAY_SEC:-5}
+      INFRA_RETRY_DELAY_SEC: ${INFRA_RETRY_DELAY_SEC:-30}
       OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     healthcheck:
@@ -152,6 +158,19 @@ services:
       JOB_PAYLOAD_ENCRYPTION_KEY: ${JOB_PAYLOAD_ENCRYPTION_KEY}
       CREDENTIAL_READ_WAIT_SEC: ${CREDENTIAL_READ_WAIT_SEC:-90}
       QUEUE_DELIVERY_LIMIT: ${QUEUE_DELIVERY_LIMIT:-10}
+      BACKOFF_SCHEDULE_SEC: ${BACKOFF_SCHEDULE_SEC:-10,30,90}
+      LOCK_RETRY_DELAY_SEC: ${LOCK_RETRY_DELAY_SEC:-5}
+      INFRA_RETRY_DELAY_SEC: ${INFRA_RETRY_DELAY_SEC:-30}
+      RABBITMQ_MANAGEMENT_URL: ${RABBITMQ_MANAGEMENT_URL:-http://rabbitmq:15672}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+      INFRA_MAX_ATTEMPTS: ${INFRA_MAX_ATTEMPTS:-20}
+      # Shared rate limiter (ADR-13); ":-" also applies the default when .env has an empty value.
+      GEMINI_RPM_LIMIT: ${GEMINI_RPM_LIMIT:-4}
+      GEMINI_TPM_LIMIT: ${GEMINI_TPM_LIMIT:-200000}
+      GEMINI_RPD_LIMIT: ${GEMINI_RPD_LIMIT:-16}
+      NOTION_RPS_LIMIT: ${NOTION_RPS_LIMIT:-2.5}
+      RATE_LIMIT_MAX_WAIT_SEC: ${RATE_LIMIT_MAX_WAIT_SEC:-60}
+      RATE_LIMIT_DEFAULT_COOLDOWN_SEC: ${RATE_LIMIT_DEFAULT_COOLDOWN_SEC:-10}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     healthcheck:
       test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/worker-heartbeat') < 30 else 1)"]
@@ -173,6 +192,9 @@ services:
       context: ./backend
       target: test
     image: notes-agent-backend:test
+    volumes:
+      # Failure diagnostics written by tests (tests/support/diagnostics.py) survive the --rm container.
+      - ./backend/test-artifacts:/app/test-artifacts
     environment:
       TEST_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/notes_test
       TEST_ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}

@@ -53,7 +53,7 @@ def test_submit_does_no_pipeline_work(api, db):
     assert job(db, job_id)["status"] == "QUEUED"
     assert count(db, "job_checkpoints") == 0
     # Nothing reaches the work queue until the outbox publisher runs (separate process).
-    assert queue_state("jobs.work").messages == 0
+    assert queue_state("jobs.work.v2").messages == 0
 
 
 def test_submit_with_parent_id(api, db):

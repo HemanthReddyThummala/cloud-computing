@@ -29,7 +29,7 @@ def test_production_worker_never_fakes_completion(api, db, procs):
         ("submitted", None, "QUEUED"), ("claimed", "QUEUED", "TRANSCRIBING"),
         ("transition", "TRANSCRIBING", "FAILED")]
     wait_until(lambda: not queue_state(f"cred.{job_id}").exists, timeout=10, what="mailbox deleted")
-    wait_until(lambda: queue_state("jobs.work").messages == 0, timeout=10, what="message acked")
+    wait_until(lambda: queue_state("jobs.work.v2").messages == 0, timeout=10, what="message acked")
 
 
 def test_sigkill_mid_stage_job_is_recovered_by_another_worker(api, db, procs, fx):
@@ -69,7 +69,7 @@ def test_sigkill_mid_stage_job_is_recovered_by_another_worker(api, db, procs, fx
     assert len(resumed) == 1 and resumed[0]["worker_id"] == survivor_name
     assert resumed[0]["from_status"] == "EXTRACTING_FRAMES" and resumed[0]["detail"]["redelivered"] is True
 
-    wait_until(lambda: queue_state("jobs.work").messages == 0, timeout=10, what="queue drained")
+    wait_until(lambda: queue_state("jobs.work.v2").messages == 0, timeout=10, what="queue drained")
     wait_until(lambda: not queue_state(f"cred.{job_id}").exists, timeout=10, what="mailbox deleted")
     print(f"\nEVIDENCE recovery: {victim_name} SIGKILLed -> {survivor_name} resumed in {recovery_sec:.2f}s")
 
@@ -82,7 +82,7 @@ def test_redelivered_message_for_terminal_job_only_cleans_up(api, db, procs):
     drain_outbox()
     procs.start("prod-worker", "notesagent.worker")
     wait_until(lambda: not queue_state(f"cred.{job_id}").exists, timeout=15, what="mailbox cleaned up")
-    wait_until(lambda: queue_state("jobs.work").messages == 0, timeout=10, what="message acked")
+    wait_until(lambda: queue_state("jobs.work.v2").messages == 0, timeout=10, what="message acked")
     assert job(db, job_id)["status"] == "FAILED"
     assert [e["event_type"] for e in events(db, job_id)].count("claimed") == 0
 
@@ -92,4 +92,4 @@ def test_malformed_message_is_dead_lettered(procs):
     procs.wait_for_log("prod-worker", "worker started")
     publish_raw(b"this is not json")
     wait_until(lambda: queue_state("jobs.dlq").messages == 1, timeout=15, what="message in DLQ")
-    assert queue_state("jobs.work").messages == 0
+    assert queue_state("jobs.work.v2").messages == 0

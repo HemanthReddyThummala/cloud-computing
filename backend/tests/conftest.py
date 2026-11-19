@@ -16,8 +16,9 @@ os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 os.environ["RABBITMQ_URL"] = os.environ["TEST_RABBITMQ_URL"]
 os.environ["REDIS_URL"] = os.environ["TEST_REDIS_URL"]
 os.environ["JOB_PAYLOAD_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
-os.environ["LOCK_BUSY_RETRY_DELAY_SEC"] = "0.5"
-os.environ["UNEXPECTED_ERROR_RETRY_DELAY_SEC"] = "0.2"
+os.environ["RABBITMQ_MANAGEMENT_URL"] = os.environ["TEST_RABBITMQ_MGMT_URL"]
+os.environ["BACKOFF_SCHEDULE_SEC"] = "2,4,8"
+os.environ["LEGACY_DRAIN_INTERVAL_SEC"] = "0.5"
 os.environ["WORKER_HEARTBEAT_FILE"] = "/tmp/test-worker-heartbeat"
 os.environ["OUTBOX_HEARTBEAT_FILE"] = "/tmp/test-outbox-heartbeat"
 
@@ -27,6 +28,7 @@ import redis  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from notesagent.common.migrate import apply_migrations  # noqa: E402
+from tests.support.diagnostics import TestDiagnostics  # noqa: E402
 from tests.support.helpers import TABLES, connect  # noqa: E402
 from tests.support.processes import Processes  # noqa: E402
 from tests.support.rabbit import RabbitAdmin  # noqa: E402
@@ -84,3 +86,38 @@ def fx(tmp_path):
     path = tmp_path / "fixture"
     path.mkdir()
     return path
+
+
+# ---------------------------------------------------------------- observational failure diagnostics
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_setup(item):
+    """Create the collector BEFORE any fixture runs, so even setup errors (e.g. clean_state) are covered."""
+    if "diag" in getattr(item, "fixturenames", ()):
+        item._diag = TestDiagnostics(item.nodeid)
+    yield
+
+
+@pytest.fixture
+def diag(request, procs, fx):
+    """Opt-in diagnostics: milestones + tracked jobs; collected only if the test fails."""
+    collector = getattr(request.node, "_diag", None) or TestDiagnostics(request.node.nodeid)
+    request.node._diag = collector
+    return collector.attach(procs=procs, fx=fx)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """On failure in setup/call/teardown of a ``diag`` test: attach diagnostics to pytest's report
+    (pytest's own traceback is untouched) and write them to DIAG_DIR. Passing runs add nothing."""
+    outcome = yield
+    report = outcome.get_result()
+    collector = getattr(item, "_diag", None)
+    if collector is None or not report.failed:
+        return
+    try:
+        collector.mark(f"failure detected in {report.when}")
+        text = collector.collect(phase=report.when, error_text=report.longreprtext)
+        path = collector.write(text, report.when)
+        report.sections.append((f"diagnostics ({report.when}) — saved to {path}", text))
+    except Exception as exc:  # noqa: BLE001 - never let diagnostics mask the real failure
+        report.sections.append(("diagnostics", f"collection failed: {type(exc).__name__}"))

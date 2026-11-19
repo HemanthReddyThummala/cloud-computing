@@ -55,7 +55,7 @@ def test_nack_requeue_does_not_increase_delivery_count(api, db, procs, fx):
         conn = await aio_pika.connect(os.environ["TEST_RABBITMQ_URL"])
         try:
             ch = await conn.channel()
-            q = await ch.declare_queue("jobs.work", passive=True)
+            q = await ch.declare_queue("jobs.work.v2", passive=True)
             counts = []
             for _ in range(3):
                 m = await q.get(no_ack=False, timeout=5)
@@ -71,36 +71,42 @@ def test_nack_requeue_does_not_increase_delivery_count(api, db, procs, fx):
 
 
 def test_unexpected_errors_are_bounded_and_dead_lettered(api, db, procs, fx):
-    """An always-failing stage: the worker's own attempt counter bounds retries, then the DLQ."""
+    """REWRITTEN for Part 3 (P3-D5): an always-failing stage (unknown exception -> transient, D1)
+    runs exactly MAX_ATTEMPTS times, then the job is DEAD_LETTERED with a DLQ copy via the outbox."""
     job_id = submit_ok(api)
-    drain_outbox()
-    procs.start("worker-a", "tests.support.run_fixture_worker", FIXTURE_DIR=fx, FIXTURE_RAISE="TRANSCRIBING")
-    wait_until(lambda: queue_state("jobs.dlq").messages == 1, timeout=60, what="message dead-lettered")
-    assert queue_state("jobs.work").messages == 0
+    procs.start("publisher", "notesagent.outbox")
+    procs.start("worker-a", "tests.support.run_fixture_worker", FIXTURE_DIR=fx, FIXTURE_RAISE="TRANSCRIBING",
+                MAX_ATTEMPTS=3)
+    row = wait_for_status(db, job_id, {"DEAD_LETTERED", "FAILED", "COMPLETED"}, timeout=60)
+    assert row["status"] == "DEAD_LETTERED", row
+    assert row["error"] == {"code": "RETRIES_EXHAUSTED", "last_error_code": "UNEXPECTED_ERROR", "attempts": 3,
+                            "message": row["error"]["message"]}
+    assert row["attempts"] == 3 and row["infra_attempts"] == 0 and row["retry"] is None
+    assert run_count(fx, job_id, "TRANSCRIBING") == 3                      # exactly MAX_ATTEMPTS executions
+    kinds = [e["event_type"] for e in events(db, job_id)]
+    assert kinds.count("retry_scheduled") == 2 and kinds.count("dead_lettered") == 1
 
-    attempts = run_count(fx, job_id, "TRANSCRIBING")
+    wait_until(lambda: queue_state("jobs.dlq").messages == 1, timeout=20, what="DLQ copy via the outbox")
     [dead] = peek_messages("jobs.dlq")
-    assert json.loads(dead.body)["job_id"] == job_id
-    print(f"\nEVIDENCE bounded retries: stage attempts={attempts}; DLQ headers="
-          f"{ {k: v for k, v in dead.headers.items() if k.startswith(('x-first-death', 'x-processing'))} }")
-    assert attempts == 10                                       # QUEUE_DELIVERY_LIMIT=10 attempts in total
-    assert dead.headers.get("x-first-death-reason") == "rejected"
-    assert dead.headers.get("x-processing-attempts") == 9       # 9 republished retries + final attempt
-
-    # KNOWN GAP (Phase 2): PostgreSQL is NOT told about the dead-lettering.
-    row = db.execute("SELECT status, error FROM jobs WHERE id = %s", (job_id,)).fetchone()
-    assert row["status"] == "TRANSCRIBING" and row["error"] is None
-    assert [e["event_type"] for e in events(db, job_id)].count("resumed") == attempts - 1
+    body = json.loads(dead.body)
+    assert body["job_id"] == job_id and body["event_type"] == "job.dead_lettered"
+    assert body["last_error_code"] == "UNEXPECTED_ERROR"
+    wait_until(lambda: not queue_state(f"cred.{job_id}").exists, timeout=10, what="mailbox deleted")
+    assert queue_state("jobs.work.v2").messages == 0
 
 
-@pytest.mark.xfail(strict=True, reason="PHASE 2 REQUIREMENT: a job whose message reaches the DLQ must "
-                                       "become DEAD_LETTERED (and its credential mailbox removed).")
-def test_phase2_requirement_dead_lettered_job_state(api, db, procs, fx):
+def test_dead_lettered_job_state_after_exhausted_retries(api, db, procs, fx):
+    """Former strict-xfail Phase 2 requirement, now satisfied for worker-side exhaustion (P3-D5):
+    the job becomes DEAD_LETTERED, its message copy reaches jobs.dlq and the mailbox is removed.
+    (Broker-initiated dead letters — crash loops — are Part 4.)"""
     job_id = submit_ok(api)
-    drain_outbox()
-    procs.start("worker-a", "tests.support.run_fixture_worker", FIXTURE_DIR=fx, FIXTURE_RAISE="TRANSCRIBING")
+    procs.start("publisher", "notesagent.outbox")
+    procs.start("worker-a", "tests.support.run_fixture_worker", FIXTURE_DIR=fx, FIXTURE_RAISE="TRANSCRIBING",
+                MAX_ATTEMPTS=2)
     wait_until(lambda: queue_state("jobs.dlq").messages == 1, timeout=60, what="message dead-lettered")
-    wait_for_status(db, job_id, {"DEAD_LETTERED"}, timeout=10)
+    row = wait_for_status(db, job_id, {"DEAD_LETTERED"}, timeout=10)
+    assert row["error"]["code"] == "RETRIES_EXHAUSTED"
+    wait_until(lambda: not queue_state(f"cred.{job_id}").exists, timeout=10, what="mailbox deleted")
 
 
 def test_sigkill_redelivery_counts_toward_delivery_limit(api, db, procs, fx):
@@ -108,17 +114,18 @@ def test_sigkill_redelivery_counts_toward_delivery_limit(api, db, procs, fx):
     job_id = submit_ok(api)
     drain_outbox()
     marker = fx / "held"
-    holder = procs.start("holder", "tests.support.hold_message", "jobs.work", marker)
+    holder = procs.start("holder", "tests.support.hold_message", "jobs.work.v2", marker)
     wait_until(marker.exists, timeout=15, what="job message held")
     procs.sigkill(holder.pid)
-    wait_until(lambda: queue_state("jobs.work").messages == 1, timeout=10, what="message returned")
-    [msg] = peek_messages("jobs.work")
+    wait_until(lambda: queue_state("jobs.work.v2").messages == 1, timeout=10, what="message returned")
+    [msg] = peek_messages("jobs.work.v2")
     print(f"\nEVIDENCE x-delivery-count after one consumer crash: {msg.headers.get('x-delivery-count')}")
     assert msg.headers.get("x-delivery-count", 0) >= 1
 
 
-def test_duplicate_deferral_does_not_consume_delivery_attempts(api, db, procs, fx):
-    """Lock-busy duplicates are republished (new message), so they never exhaust the delivery limit."""
+def test_duplicate_deferral_does_not_consume_attempts(api, db, procs, fx):
+    """REWRITTEN for Part 3 (P3-D5): lock-busy duplicates go through the lock delay queue
+    (jobs.retry.<LOCK_RETRY_DELAY_SEC>s); repeated deferrals count no attempt and reach no DLQ."""
     procs.start("worker-a", "tests.support.run_fixture_worker", FIXTURE_DIR=fx, FIXTURE_GATE="TRANSCRIBING")
     procs.start("worker-b", "tests.support.run_fixture_worker", FIXTURE_DIR=fx, FIXTURE_GATE="TRANSCRIBING")
     for n in ("worker-a", "worker-b"):
@@ -127,8 +134,10 @@ def test_duplicate_deferral_does_not_consume_delivery_attempts(api, db, procs, f
     drain_outbox()
     publish_job_message(job_id)
     wait_until(lambda: len(list(fx.glob(f"started.{job_id}.*"))) == 1, what="stage gated")
-    wait_until(lambda: procs.all_logs().count("deferring duplicate message") >= 12, timeout=30,
-               what="more deferrals than the delivery limit")
+    wait_until(lambda: procs.all_logs().count("deferring duplicate message") >= 3, timeout=40,
+               what="repeated deferrals through the delay queue")
+    row = db.execute("SELECT attempts, infra_attempts, retry FROM jobs WHERE id = %s", (job_id,)).fetchone()
+    assert row == {"attempts": 0, "infra_attempts": 0, "retry": None}
     assert queue_state("jobs.dlq").messages == 0
     (fx / f"release.{job_id}").write_text("")
     wait_for_status(db, job_id, {"COMPLETED"})

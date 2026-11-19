@@ -14,7 +14,7 @@ EXPECTED_TABLES = {"jobs", "job_events", "job_checkpoints", "outbox", "idempoten
 
 def test_migration_recorded_and_tables_exist(db):
     assert {r["version"] for r in db.execute("SELECT version FROM schema_migrations")} == {
-        "001_init", "002_result_integrity"}
+        "001_init", "002_result_integrity", "003_retry_dlq_foundation", "004_dead_letter_audit_outcomes"}
     tables = {r["table_name"] for r in db.execute(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")}
     assert EXPECTED_TABLES <= tables
