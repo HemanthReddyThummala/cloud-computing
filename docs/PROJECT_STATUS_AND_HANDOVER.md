@@ -1,7 +1,8 @@
 # Project status and handover — Distributed Multimodal Video Note-Taking Agent
 
 - **Prepared:** 2026-11-20, for an independent review of the current project state. **Updated:**
-  2026-11-20 after Phase A Part 2 (shared rate limiter).
+  2026-11-20 after Phase A Part 2 (shared rate limiter) after Phase B Part 1 (TRANSCRIBING stage) and its deployment verification, after Phase B Part 2
+  (SUMMARIZING stage), after Phase B Part 3 (EXTRACTING_FRAMES stage), and after Phase B Part 4 (PUBLISHING stage).
 - **Sources:** `PROJECT_SPEC.pdf` (authoritative), `docs/decisions.md` (ADRs), `docs/api.md`, the
   session logs in `docs/session_logs/`, and direct inspection of the repository, Git and the running
   Docker stack.
@@ -86,6 +87,10 @@ Redis 7: worker heartbeats / health (planned: global rate-limit buckets)
 | Part 3 | Classified retries via the outbox (ADR-11): `MAX_ATTEMPTS` = total executions (5), backoff 10/30/90 s with the last step repeating, Retry-After honoured, uncounted delay hops, new event id per retry (message identity gates stale copies), DEAD_LETTERED with `RETRIES_EXHAUSTED` + DLQ copy, `retry` view in the API, delay-without-counting when PostgreSQL is unavailable | [TEST] 15 integration (incl. 5 SIGKILL crash windows) + 13 unit; crash set 10 consecutive runs 160/160 |
 | Phase A Part 1 (= Phase 2 Part 4) | Broker dead-letter auditing (ADR-12): `jobs.dlq.audit` + parking queue (at-least-once), auditor in every worker, origin marker `x-event-type` on every published message, migration 004 (outcomes `stale`, `inconsistent`), audit-limit validation for the carried-over delivery count | [TEST] 43 unit + 17 integration + 12 migration + 1 topology; based on two isolated RabbitMQ probes |
 | Deployment | Dev stack moved to Phase 2; migrations 003/004 applied; legacy `jobs.work` removed | [RUN] 2026-11-19, see §4 |
+| **Phase B Part 4** | **PUBLISHING stage** (ADR-17, `worker/publish.py`, `worker/notion.py`): `httpx` Notion client (Bearer token from the credential mailbox, `Notion-Version` 2026-03-11, no own retries, a `Provider.NOTION` permit before every request, method-aware error classification). Deterministic page plan: marker (job id) first, summary, key points, timestamped sections with video links, key frames uploaded via the File Upload API with LLM captions (time + caption + reason), text-only when no frames. Destination: job `notion_parent_id` or `NOTION_DEFAULT_PARENT_ID` (else FAILED `NOTION_PARENT_MISSING` before any request). **No duplicate pages:** every attempt reconciles first (child page with the same title whose first block carries the job marker) and writes only the missing suffix of the plan; covers redelivery, 429 retries and uncertain 5xx writes. Result `{notion_page_url, frames_requested, frames_published}`, with frames_published counted from Notion; permanent upload failure → note + `FRAME_UPLOAD_FAILED` warning | [TEST] 19 unit (in-process fake Notion) + 9 integration (real worker + fake Notion server process, including SIGKILL mid-append and after all writes); full suite **825 passed** (2026-11-20 22:37). **No real Notion verification** (no OAuth token exists yet). **Not deployed** |
+| **Phase B Part 3** | **EXTRACTING_FRAMES stage** (ADR-16, `worker/frames.py`, `YouTubeClient.download_video`): one `Provider.YOUTUBE` permit + one `yt-dlp` download of a video-only stream (≤ 720p, H.264 preferred, no internal retries, size guard) into a private temp dir → per Gemini timestamp an exact FFmpeg frame (JPEG ≤ 1280 px, never upscaled), validated with `ffprobe` (decodable MJPEG, non-empty, ≤ 5 MiB). Timestamps checked against the real duration. **Only FFmpeg-decoded source frames are stored** (base64 in the checkpoint, sha256), each with its timestamp, Gemini caption/reason and `caption_basis=transcript`. **Graceful degradation:** failed timestamps → warnings `FRAME_EXTRACTION_FAILED` (spec shape) → COMPLETED_WITH_WARNINGS; source not obtainable for non-retryable reasons → text-only. 429 / network / 5xx → existing retries; unavailable → FAILED (ADR-14). Temp dirs removed in every case; leftovers of dead/zombie workers purged. **Docker:** Debian `ffmpeg` 7.1.5 in the base image (≈ 430 MB); **no JS runtime** (verified not needed today) | [TEST] 42 unit (real FFmpeg on synthetic videos) + 7 integration (real worker); full suite **797 passed** (2026-11-20 21:19). [RUN] real `yt-dlp` + FFmpeg on one public video outside the suite: 1 permit, 2 real frames, 1 out-of-range warning, temp dir empty. **Not deployed** (dev image rebuilt, 961 MB) |
+| **Phase B Part 2** | **SUMMARIZING stage** (ADR-15, `worker/summarize.py`, `worker/gemini.py`): Gemini `gemini-3.8-flash` (official `google-genai==3.6.1`, SDK retries off, JSON-schema output, thinking `low`) over the TRANSCRIBING checkpoint → validated checkpoint with `summary`, `key_points`, ordered `sections` (`start_sec`), `important_timestamps` (`timestamp_sec`, `caption`, `reason`, `transcript_excerpt`; ≤ `MAX_FRAMES` 8, de-duplicated). **Grounding:** Gemini answers with global transcript segment numbers; the timestamps are those segments' real starts (invented numbers dropped). **Chunking:** in order by `TRANSCRIPT_CHUNK_TOKENS` (12,000, capped by TPM), + 1 merge request when chunked. A Gemini permit before every request + `settle()`. Errors → existing retries (429/RetryInfo + shared cooldown, daily quota → Pacific reset, 5xx/network transient, invalid output bounded → DEAD_LETTERED; 4xx/blocked/missing key → FAILED) | [TEST] 33 unit + 11 integration (real worker, fake Gemini raising real SDK errors); full suite **748 passed** (2026-11-20 20:11). [RUN] config: key loaded and masked (hash-compared, never printed); **one real Gemini request** via the production stage on the stored 'Me at the zoo' transcript: OK, 32.7 s, 417/243 tokens, 1 grounded timestamp. **Not deployed** (dev image rebuilt, containers not recreated) |
+| **Phase B Part 1** | **TRANSCRIBING stage** (ADR-14, `worker/transcribe.py`, `worker/youtube.py`): `yt-dlp` metadata (title + true duration) → **constraint A** (> `MAX_VIDEO_DURATION_SEC` 1200 → FAILED `VIDEO_TOO_LONG` before any transcript request; exactly 1200 accepted; invalid/missing duration → FAILED `VIDEO_DURATION_UNKNOWN`) → `youtube-transcript-api` list/choose/fetch → checkpoint with ordered `{start, duration, end, text}` segments + `video_title`/`duration_sec` on the job. A `Provider.YOUTUBE` limiter permit before each of the 3 requests. Library errors → ADR-10 classes (unavailable/private/404/410/no transcript → FAILED; 429/blocking → shared cooldown + outbox retry; network/5xx → bounded retry). Dependencies `yt-dlp==2026.10.26`, `youtube-transcript-api==1.2.5` | [TEST] 40 unit + 11 integration with the real worker and a fake YouTube client; full suite **704 passed** (2026-11-20). [RUN] production stage code + real client against one public video outside the suite: title, 19 s, 6 timestamped segments, 3 permits. **Deployed to the dev stack 2026-11-20 02:06 and verified with a real job** |
 | Phase A Part 2 | **Shared external-API rate limiter** (ADR-13, `common/ratelimit.py`): atomic Redis Lua checks on Redis time. Gemini: RPM 4 and input TPM 200,000 (sliding 60 s windows), RPD 16 per Pacific day. Notion: 2.5/s per connection. YouTube: no quota, cooldown only. Shared Retry-After cooldown recorded by the worker's existing failure path; waits ≤ 60 s in-process, otherwise the existing outbox retry; Redis down → `RateLimiterUnavailable` (infra budget), no provider call. Wired into `StageContext.limiter`, settings and the Compose worker | [TEST] 25 tests incl. 3-process RPM/TPM/RPD/Notion, shared cooldown from a real worker, Redis-down worker path; full suite 653 passed (2026-11-20). **Not yet deployed to the dev stack; no real provider calls exist yet** |
 
 Each part has detailed session logs in `docs/session_logs/` (11 files).
@@ -94,17 +99,21 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
 
 ## 4. Current development and Docker status
 
-[RUN] inspected 2026-11-20:
+[RUN] **Redeployed and verified 2026-11-20 02:06** (Phase B Part 1; see
+`docs/session_logs/phaseB_part1_deployment_verification.md`):
 
 | Service | State | Image |
 |---|---|---|
-| gateway | healthy | `notes-agent-backend:dev` (Phase 2, ID `63cf80e0e2cd`) |
+| gateway | healthy | `notes-agent-backend:dev` (ID **`8cb661395cde`**: rate limiter + TRANSCRIBING stage) |
 | outbox-publisher | healthy | same |
-| worker ×2 | healthy | same |
-| postgres / rabbitmq / redis | healthy | `postgres:16`, `rabbitmq:4.4.1-management`, `redis:7-alpine` (not recreated during deployment; volumes preserved) |
+| worker ×2 | healthy | same; `stages=['TRANSCRIBING']`, `MAX_VIDEO_DURATION_SEC=1200`, `TRANSCRIPT_LANGUAGES=en` |
+| postgres / rabbitmq / redis | healthy | `postgres:16`, `rabbitmq:4.4.1-management`, `redis:7-alpine` (not recreated in either deployment; restarts 0; volumes preserved) |
 
-- **Database:** migrations `001`–`004` applied. One job row exists: the deployment smoke test,
-  `FAILED / PIPELINE_STAGE_UNAVAILABLE`.
+- **Database:** migrations `001`–`004` applied. Two job rows exist:
+  - the first deployment's smoke test, `FAILED / PIPELINE_STAGE_UNAVAILABLE` at TRANSCRIBING;
+  - the Phase B verification job for the real public video `jNQXAC9IVRw`: title "Me at the zoo",
+    19 s, a TRANSCRIBING checkpoint with 6 timestamped segments, then SUMMARIZING → `FAILED /
+    PIPELINE_STAGE_UNAVAILABLE` (expected).
 - **RabbitMQ vhost `/`:**
   - `jobs.work.v2`: 2 consumers.
   - `jobs.dlq.audit`: 2 consumers. Arguments: limit 21, at-least-once, reject-publish, DLX `""` →
@@ -115,8 +124,15 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
   - The legacy `jobs.work` queue was **removed** with `scripts/migrate_work_queue.py`; no policies are
     left.
 - **`GET /healthz`:** HTTP 200 (gateway, PostgreSQL, RabbitMQ, Redis ok; 2 live workers).
-- **Functionally:** the worker has **no pipeline stages**. Every real job ends
-  `FAILED / PIPELINE_STAGE_UNAVAILABLE` by design (no fake stages).
+- **Functionally (deployed image):**
+  - A real job is transcribed: title, true duration, timestamped transcript, constraint A.
+  - It then fails honestly at SUMMARIZING (`PIPELINE_STAGE_UNAVAILABLE`), which is not implemented yet.
+  - The shared rate limiter is active in both workers.
+- **Verification evidence:**
+  - Over-20-min rejection checked with real metadata and a lowered limit in a throwaway container
+    (`VIDEO_TOO_LONG` after the metadata request only).
+  - Logs: no tracebacks or retries; 0 secret-value hits.
+  - 124 targeted tests passed after the deployment.
 
 ---
 
@@ -126,17 +142,17 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
 |---|---|
 | R1 gateway / broker / ≥ 2 workers | **Done** [TEST][RUN] |
 | R1/R2 browser extension (content script, background, OAuth, popup) | **NOT IMPLEMENTED** — `extension/` contains only `manifest.json` (name, version, key) |
-| R3 transcript + duration | **NOT IMPLEMENTED** (stage registry is empty) |
-| R3 LLM synthesis (bullets, timestamps, captions, chunking) | **NOT IMPLEMENTED** |
-| R3 frame extraction | **NOT IMPLEMENTED** (no ffmpeg/yt-dlp in the image) |
-| R3 Notion publishing (images, captions, default parent, idempotent against redelivery) | **NOT IMPLEMENTED** |
+| R3 transcript + duration | **Done** (Phase B Part 1, ADR-14) [TEST]; deployed and verified with a real job on the dev stack [RUN] |
+| R3 LLM synthesis (bullets, timestamps, captions, chunking) | **Done** (Phase B Part 2, ADR-15) [TEST]; one real Gemini request verified [RUN]; not yet deployed |
+| R3 frame extraction | **Done** (Phase B Part 3, ADR-16) [TEST]; one real video verified outside the suite [RUN]; not yet deployed |
+| R3 Notion publishing (images, captions, default parent, idempotent against redelivery) | **Implemented** (Phase B Part 4, ADR-17) [TEST] against a fake Notion API; **not verified against real Notion** (needs the OAuth token, Phase C); not deployed |
 | R4 lifecycle / state machine | **Done** [TEST] |
 | R5 API contract | **Done** [TEST]; a *working* Notion URL can only be verified once publishing exists |
 | R6 429 handling | **Mechanism done** with fixture stages [TEST]; no real API calls exist yet |
 | R6 crash recovery | **Done for the infrastructure** [TEST][RUN]; "no duplicate Notion page" depends on idempotent publishing (not built) |
 | R6 graceful degradation | Result logic present (`frames_published < frames_requested` → WITH_WARNINGS) [SRC][TEST]; the frame stage and text-only page are **not built** |
 | R6 DLQ | **Done** (worker exhaustion + broker dead letters) [TEST]; see decision D-1 in §10 |
-| R7-A ≤ 20 min / reject longer | **NOT IMPLEMENTED** (`MAX_VIDEO_DURATION_SEC=1200` exists in `.env` only; no code reads it) |
+| R7-A ≤ 20 min / reject longer | **Done** in the TRANSCRIBING stage (FAILED `VIDEO_TOO_LONG` for > 1200 s before transcript extraction; 1200 accepted) [TEST] |
 | R7-B real frames + captions | **NOT IMPLEMENTED** |
 | R8 README | **NOT IMPLEMENTED** (no README in the repository) |
 | R8 compose / health check | **Done** [RUN] |
@@ -146,8 +162,34 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
 
 ## 6. Git state
 
-- **Branch:** `phase-2`. **HEAD:** `49eed183fc8b9a040c170aed5d691ef6e0bbd33a` (= `main` =
-  tag `phase1-baseline`). History: `927ec18` Phase 0, `49eed18` Phase 1.
+- **Current (2026-11-20, after Phase B Part 1):**
+  - Branch `phase-2`, **HEAD `1aa6863`** ("Complete Phase 2 backend reliability and rate limiting",
+    committed by the user; it contains all work up to Phase A Part 2).
+  - `main` = `phase1-baseline` = `49eed18`.
+  - 0 staged.
+  - **Update after Phase B Part 2:** also uncommitted:
+    - `backend/notesagent/worker/{gemini,summarize}.py`,
+      `backend/tests/support/fake_gemini.py`, `backend/tests/test_{summarize_stage,unit_summarize}.py`;
+    - `docs/session_logs/phaseB_part1_deployment_verification.md` and
+      `docs/session_logs/phaseB_part2_gemini_summarization.md`;
+    - further edits to `config.py`, `stages.py`, `requirements.*`, `docker-compose.yml`,
+      `.env.example`, `docs/decisions.md`, `tests/support/{fake_youtube,run_youtube_worker}.py`,
+      `tests/test_{worker,transcribe_stage}.py`.
+
+    `git status`: 24 entries, 0 staged.
+  - Uncommitted Phase B Part 1 changes:
+    - **modified:** `.env.example`, `backend/notesagent/common/config.py`,
+      `backend/notesagent/worker/stages.py`, `backend/requirements.in`, `backend/requirements.txt`,
+      `backend/tests/test_worker.py`, `docker-compose.yml`, `docs/api.md`, `docs/decisions.md`,
+      this report;
+    - **untracked:** `backend/notesagent/worker/{transcribe,youtube}.py`,
+      `backend/tests/support/{fake_youtube,run_youtube_worker}.py`,
+      `backend/tests/test_{transcribe_stage,unit_transcribe}.py`,
+      `docs/session_logs/phaseB_part1_transcript_stage.md`.
+
+  The entries below are historical.
+- **Branch:** `phase-2`. **HEAD (before the user's commit):** `49eed183fc8b9a040c170aed5d691ef6e0bbd33a`
+  (= `main` = tag `phase1-baseline`). History: `927ec18` Phase 0, `49eed18` Phase 1.
 - **Update 2026-11-20 (after Phase A Part 2):** still no new commit (HEAD `49eed18`), but the index was
   changed outside the assistant during that session: **65 paths staged**, while HEAD is unchanged.
   - Files edited after that staging are partially staged: `MM backend/tests/support/fixture_stages.py`,
@@ -205,6 +247,10 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
 | 10 | Error classification (FAILED = cannot succeed; retryable classes with budgets); YouTube 404/410 = fatal (decision D3) |
 | 11 | Retries through the outbox; message-identity gating; only `nack(requeue=True)` is uncounted (`reject(requeue=True)` is counted — measured) |
 | 12 | Broker dead-letter auditing with the parking queue; newest `x-death`; origin marker; dedup key; `stale` / `inconsistent` outcomes |
+| 17 | PUBLISHING: httpx Notion client with a permit per request; deterministic page plan with a job marker; reconcile before every write (no duplicate pages, resume the plan suffix); File Upload API for real frames with LLM captions; text-only fallback; frames_published counted from Notion |
+| 16 | EXTRACTING_FRAMES: one yt-dlp video-only download (permit) + exact FFmpeg frames validated by ffprobe; only real source frames stored (base64 + sha256) with transcript-based captions; failed timestamps → warnings, unobtainable source → text-only; FFmpeg in the image, no JS runtime |
+| 15 | SUMMARIZING: Gemini via `google-genai` (SDK retries off), numbered transcript lines → segment numbers → real segment start times (grounded); pydantic-validated notes; ordered token-budget chunking + merge request; permit + settle per request; classified errors into the existing retries; no partial-chunk persistence |
+| 14 | TRANSCRIBING: yt-dlp metadata (true duration, constraint A before any transcript request) + youtube-transcript-api; limiter permit per request; library errors → ADR-10 classes; **D-1 settled: unavailable/private/deleted → FAILED** (DLQ demo uses retryable failures); yt-dlp JS-runtime deprecation noted |
 | 13 | Shared external-API rate limiter: atomic Redis Lua on Redis time. Gemini RPM/input-TPM sliding windows + RPD per Pacific day (values used as given, already × 0.8); Notion spacing per connection; YouTube cooldown only. Shared Retry-After cooldown reported by the worker; waits ≤ `RATE_LIMIT_MAX_WAIT_SEC`, else the existing outbox retry; Redis down → `RateLimiterUnavailable` |
 
 ---
@@ -213,9 +259,9 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
 
 | Service | Method / model | Credential | Status |
 |---|---|---|---|
-| YouTube transcript + duration | `youtube-transcript-api` (no key; unofficial web-client interface) + `yt-dlp` metadata — **approved in the Phase 0 plan, not recorded in an ADR** | none | [PLAN] not installed |
-| Frames | `yt-dlp` stream URL + `ffmpeg -ss T -frames:v 1` | none | [PLAN] |
-| Gemini | `gemini-3.8-flash`, thinking level `low`, free tier | `GEMINI_API_KEY` (from Google AI Studio, project **without billing**) | key **empty** in `.env`; limits unknown |
+| YouTube transcript + duration | `youtube-transcript-api==1.2.5` (no key; unofficial web-client interface) + `yt-dlp==2026.10.26` metadata — ADR-14; settings `MAX_VIDEO_DURATION_SEC` (1200), `TRANSCRIPT_LANGUAGES` (en), `YOUTUBE_REQUEST_TIMEOUT_SEC` (30) | none | **Implemented** (Phase B Part 1); not deployed |
+| Frames | `yt-dlp` video-only download (≤ 720p) + `ffmpeg -ss T -frames:v 1` (ADR-16); settings `FRAME_SOURCE_MAX_HEIGHT` (720), `FRAME_MAX_WIDTH` (1280) | none | **Implemented** (Phase B Part 3); FFmpeg 7.1.5 in the image; not deployed |
+| Gemini | `gemini-3.8-flash`, thinking level `low`, free tier | `GEMINI_API_KEY` (from Google AI Studio, project **without billing**) | **Set by the user in `.env`; loaded and verified** (hash-compared, masked; one real request OK on 2026-11-20). Limits per ADR-13: 4 RPM / 200k TPM / 16 RPD. SUMMARIZING implemented (ADR-15) |
 | Notion | REST API (httpx), File Upload API, OAuth | `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `NOTION_REDIRECT_URI`, `NOTION_DEFAULT_PARENT_ID` | all **empty** in `.env`; integration not yet created |
 
 **Documented external limits** (read 2026-11-19, see `docs/session_logs/external_services_credentials_inspection.md`):
@@ -254,7 +300,11 @@ All tests run in Docker against real PostgreSQL/RabbitMQ/Redis using isolated te
 
 | Run | Date / time (host clock) | Result |
 |---|---|---|
-| **Full suite (latest)** | 2026-11-20 01:15–01:26 | **653 passed**, 0 failed, 0 errors (658.35 s), including the 25 new rate-limiter tests (`test_ratelimit.py`: 25 passed in 32.36 s) |
+| **Full suite (latest)** | 2026-11-20 22:25–22:37 | **825 passed**, 0 failed, 0 errors (717.59 s), incl. 19 unit (`test_unit_publish.py`) + 9 integration (`test_publish_stage.py`) publishing tests |
+| Full suite (after Phase B Part 3) | 2026-11-20 21:08–21:19 | 797 passed, 0 failed, 0 errors (657.90 s), incl. 42 unit (`test_unit_frames.py`, real FFmpeg) + 7 integration (`test_frames_stage.py`) frame tests |
+| Full suite (after Phase B Part 2) | 2026-11-20 20:00–20:11 | 748 passed, 0 failed, 0 errors (640.58 s), incl. 33 unit (`test_unit_summarize.py`) + 11 integration (`test_summarize_stage.py`) summarization tests. (An earlier run that day had 4 failures in `test_ratelimit.py` from a config validator added in Phase B Part 2; fixed, see that session log) |
+| Full suite (after Phase B Part 1) | 2026-11-20 01:49–02:00 | 704 passed, 0 failed, 0 errors (627.78 s), incl. 40 unit (`test_unit_transcribe.py`) + 11 integration (`test_transcribe_stage.py`) transcript tests |
+| Full suite (after Phase A Part 2) | 2026-11-20 01:15–01:26 | 653 passed, 0 failed, 0 errors (658.35 s), including the 25 new rate-limiter tests (`test_ratelimit.py`: 25 passed in 32.36 s) |
 | Full suite (before Phase A Part 2) | 2026-11-19 22:46–22:56 | 628 passed, 0 failed, 0 errors (617.65 s) |
 | Targeted integration set after deployment (dead-letter audit, topology, migration 004, health, API, worker, outbox, work-queue migration) | 2026-11-19 23:28–23:34 | **105 passed** |
 | Crash set (16 crash/SIGKILL tests) × 10 consecutive runs | 2026-11-19 | **160/160 passed** |
@@ -282,7 +332,8 @@ extension. All stage behaviour is exercised with fixture stages.
   - (a) make it retryable so it reaches DEAD_LETTERED (≈ 6 s with demo profile `2,4,8` / 3 attempts);
   - (b) keep FAILED and document another DLQ trigger.
 
-  Recommended: (a). Still open.
+  **Settled 2026-11-20 by the user's Phase B Part 1 instruction: FAILED** (option b; ADR-14). The DLQ
+  demo must use a retryable failure (e.g. persistent network/5xx errors with the demo profile).
 - **Notion redirect URI:** the `chromiumapp.org` form is not documented by Notion; it needs a real test
   (approval required).
 - **Transcript method:** no ADR yet.
@@ -317,26 +368,20 @@ extension. All stage behaviour is exercised with fixture stages.
 
 ## 11. Recommended next task
 
-**Phase A Part 2 (shared rate limiter) is done** — see §3 and ADR-13. Evidence: 25 dedicated tests and
-the full suite of 653 passed.
+**Phase B Part 4 (PUBLISHING) is implemented** — see §3 and ADR-17. Evidence: 28 new tests and the full
+suite of 825 passed, all against a fake Notion API. **The whole backend pipeline now exists**
+(TRANSCRIBING → SUMMARIZING → EXTRACTING_FRAMES → PUBLISHING), but it has **not** been run against the real
+Notion API, because no OAuth token exists yet. Phase B Parts 1–4 are uncommitted (HEAD `1aa6863`).
 
-1. **The user reviews and commits** the work on `phase-2`. The index was partly staged during Phase A
-   Part 2; re-stage the files listed in §6 so the commit contains the latest versions.
-2. **The user decides D-1** (unavailable video → DLQ or FAILED). This is needed before the transcript
-   stage's error mapping is written.
-3. **Optional, on instruction:** redeploy the dev stack, so the running workers include the limiter
-   (same procedure as the Phase A deployment, no migration needed).
-4. **Next mandatory development task — Phase B, part 1: transcript stage** (TRANSCRIBING):
-   - `youtube-transcript-api` + `yt-dlp` metadata (title, exact duration) behind
-     `ctx.limiter.acquire(Provider.YOUTUBE)`;
-   - **constraint A** (> `MAX_VIDEO_DURATION_SEC` = 1200 → deterministic FAILED);
-   - library exceptions mapped to classified errors (ADR-10), including the D-1 decision;
-   - an idempotent checkpoint;
-   - an ADR recording the transcript method.
-
-   This adds new dependencies, which need approval. The Gemini, frame and Notion stages follow,
-   each acquiring a limiter permit before every external call.
-
-After that come Phase B (transcript, Gemini, frames, Notion, with constraints A and B), Phase C
-(extension and OAuth) and Phase D (README, grading demos, latency/burst runs, final submission), as
-set out in `docs/session_logs/project_spec_compliance_audit.md`.
+1. **The user reviews and commits** Phase B Parts 1–4, the extension probe and the inspection logs (41
+   status entries, nothing staged).
+2. **The user completes the redirect-URI check** (`extension/README.md`): load the unpacked extension,
+   read `getRedirectURL("notion")`, register it in the "Video Notes Agent" integration, and fill
+   `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `NOTION_REDIRECT_URI`, `NOTION_DEFAULT_PARENT_ID` in the
+   local `.env` (never in chat).
+3. **Next mandatory development task — Phase C, part 1: Notion OAuth** (gateway code exchange/refresh
+   with the client secret server-side, CORS for `ALLOWED_EXTENSION_ORIGIN`, extension
+   `launchWebAuthFlow` + token storage). This yields the first real token, which allows the **first
+   real end-to-end publish** (verify the page, images, captions and no duplicates on the real API).
+   After that: the rest of Phase C (content-script button, popup progress) and Phase D (README, demos,
+   deployment).

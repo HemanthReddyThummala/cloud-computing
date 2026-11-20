@@ -109,6 +109,29 @@ Unknown or malformed id → **404** `JOB_NOT_FOUND`. Polling never modifies the 
   "error": { "code": "VIDEO_TOO_LONG", "message": "..." } }
 ```
 
+FAILED error codes set by the TRANSCRIBING stage (ADR-14):
+
+- `VIDEO_TOO_LONG`: longer than `MAX_VIDEO_DURATION_SEC` (1200 s; exactly 1200 is accepted). Rejected
+  before any transcript request.
+- `VIDEO_DURATION_UNKNOWN`: missing or invalid duration (for example a live stream).
+- `YOUTUBE_VIDEO_UNAVAILABLE`: private, deleted or otherwise unavailable, including 404/410.
+- `YOUTUBE_AGE_RESTRICTED`.
+- `YOUTUBE_VIDEO_UNPLAYABLE`.
+- `YOUTUBE_TRANSCRIPT_UNAVAILABLE`: captions disabled, missing or empty.
+
+These fail after one execution. YouTube 429s, blocking, 5xx and network errors are retried instead:
+`GET /jobs/{id}` shows `retry` while the job waits.
+
+While or after TRANSCRIBING, `GET /jobs/{id}` reports the real `video_title` and `duration_sec`.
+
+**Frame warnings (EXTRACTING_FRAMES, ADR-16):** a timestamp whose frame cannot be captured never fails
+the job. It is omitted and reported as a warning, and the job ends `COMPLETED_WITH_WARNINGS` (or as a
+text-only page if no frame could be captured):
+
+```json
+"warnings": [ { "code": "FRAME_EXTRACTION_FAILED", "timestamp_sec": 461.0, "reason": "TIMESTAMP_OUT_OF_RANGE" } ]
+```
+
 **DEAD_LETTERED → 200** (a *retryable* failure exhausted its retry budget; same shape as FAILED)
 
 ```json

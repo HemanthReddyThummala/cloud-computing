@@ -340,3 +340,181 @@ why, and what it does **not** guarantee.
 - **Configuration:** `GEMINI_RPM_LIMIT`, `GEMINI_TPM_LIMIT`, `GEMINI_RPD_LIMIT`, `NOTION_RPS_LIMIT`,
   `RATE_LIMIT_MAX_WAIT_SEC`, `RATE_LIMIT_DEFAULT_COOLDOWN_SEC` (settings + worker service in Compose with
   defaults that also apply to empty `.env` values).
+
+## ADR-14 TRANSCRIBING stage: yt-dlp metadata + youtube-transcript-api (Phase B, Part 1)
+
+- **Method:** `yt-dlp` (`extract_info(download=False, process=False)`, metadata only) for the title and
+  the **true duration**; `youtube-transcript-api` (`list` → choose → `fetch`) for the timestamped
+  transcript. No API key. The official YouTube Data API is not usable (`captions.download` needs OAuth
+  and edit rights on the video). Pinned: `yt-dlp==2026.10.26`, `youtube-transcript-api==1.2.5`
+  (+ `requests`, `defusedxml`, `urllib3`, `charset-normalizer`, `certifi`). Both libraries are
+  unofficial interfaces and may break or be blocked; versions are pinned and easy to bump.
+- **Constraint A:** after the metadata request and **before any transcript request**, a duration above
+  `MAX_VIDEO_DURATION_SEC` (1200) → FAILED `VIDEO_TOO_LONG`; exactly 1200 is accepted (the raw,
+  unrounded duration is compared). A missing, zero, negative, non-finite or non-numeric duration (e.g.
+  live streams) → FAILED `VIDEO_DURATION_UNKNOWN` — never treated as 0.
+- **Transcript choice:** `TRANSCRIPT_LANGUAGES` (default `en`) in priority order, manual before
+  auto-generated; otherwise the first available transcript (manual first). Segments keep their order
+  and are stored as `{start, duration, end, text}` (seconds, 3 decimals; text stripped; empty segments
+  dropped). An empty result → FAILED `YOUTUBE_TRANSCRIPT_UNAVAILABLE`.
+- **Output:** the stage checkpoint `{video_id, title, duration_sec, duration_exact, transcript:
+  {source, language_code, language, is_generated, segment_count, segments}}` plus `video_title` /
+  `duration_sec` on the job row, written by the worker together with the TRANSCRIBING → SUMMARIZING
+  transition in ONE transaction, then acked (ADR-05). The stage has no side effects; a redelivery before
+  that commit repeats it, after it the job resumes at SUMMARIZING without repeating it.
+- **Rate limiting:** a `Provider.YOUTUBE` permit from the shared limiter (ADR-13) before each of the
+  three requests (metadata, transcript list, transcript fetch); no numeric quota. The blocking library
+  calls run in a thread with a per-request timeout (`YOUTUBE_REQUEST_TIMEOUT_SEC`, 30 s).
+- **Classification (ADR-10 codes, no upstream text kept):**
+  - FAILED: `YOUTUBE_VIDEO_UNAVAILABLE` (private, deleted, removed, terminated account, members-only,
+    geo-blocked, upcoming live, HTTP 404/410, `VideoUnavailable`/`InvalidVideoId`),
+    `YOUTUBE_AGE_RESTRICTED`, `YOUTUBE_VIDEO_UNPLAYABLE`, `YOUTUBE_TRANSCRIPT_UNAVAILABLE`
+    (`TranscriptsDisabled`/`NoTranscriptFound`/empty), `VIDEO_TOO_LONG`, `VIDEO_DURATION_UNKNOWN`.
+  - Retry via the existing outbox system + shared cooldown: HTTP 429 → `YOUTUBE_RATE_LIMITED`
+    (Retry-After honoured); bot check / `RequestBlocked` / `IpBlocked` → `YOUTUBE_BLOCKED` (RateLimited,
+    default cooldown); 5xx, 403, network/transport errors → TransientError; other library failures
+    (PoToken, unparsable data) → `YOUTUBE_TRANSCRIPT_TEMPORARY`. Bounded by `MAX_ATTEMPTS`, then
+    DEAD_LETTERED.
+  - yt-dlp exposes availability reasons only as messages: fixed patterns are matched, the text is never
+    stored or logged.
+- **Decision D-1 (compliance audit) settled:** permanently unavailable / private / deleted videos end
+  **FAILED** after one execution (not retried, not dead-lettered). The DLQ is demonstrated with retryable
+  failures instead (e.g. persistent network/5xx errors, demo profile `MAX_ATTEMPTS=3`).
+- **Known risk:** yt-dlp warns that YouTube extraction without a JavaScript runtime (deno) is
+  deprecated. Metadata works without it (verified 2026-11-20); frame extraction (later) may need one.
+
+## ADR-15 SUMMARIZING stage: Gemini study notes with grounded timestamps (Phase B, Part 2)
+
+- **Model and SDK:** the official `google-genai` SDK (pinned `3.6.1`, plus its dependencies
+  `google-auth`, `httpx2`, `httpcore2`, `tenacity`, `websockets`, `truststore`, `distro`, `sniffio`,
+  `pyasn1`, `pyasn1_modules`). Model `GEMINI_MODEL` = `gemini-3.8-flash` (ADR-06, free tier, no paid
+  fallback). `GEMINI_THINKING_LEVEL=low`, JSON output constrained by `response_json_schema`,
+  `max_output_tokens` 8192, request timeout 120 s. The SDK's own retries are disabled
+  (`HttpRetryOptions(attempts=1)`); retries happen only through ADR-11. The key comes from
+  `GEMINI_API_KEY` (`SecretStr`, passed to the worker by Compose; never logged or put in errors).
+- **Input and grounding:** the TRANSCRIBING checkpoint's segments are rendered as
+  `[#<global segment index> <mm:ss>] text`. Gemini returns segment **numbers** (`start_segment`,
+  `segment`), never free-form times. Each number is validated against the chunk it was given; the
+  stored timestamp is that segment's real `start` (seconds in the original video). Invalid or invented
+  numbers are dropped and counted (`validation.dropped_*`). Captions describe what the speaker presents
+  ("The speaker shows …") and why it matters; the checkpoint states that frames are not yet
+  extracted or visually checked.
+- **Output (checkpoint, validated with pydantic):** `summary`, `key_points` (≤ 12), `sections`
+  (`title`, `start_sec`, `points`, chronological), `important_timestamps` (`timestamp_sec`,
+  `segment_index`, `caption`, `reason`, `transcript_excerpt`; chronological, de-duplicated when closer
+  than 10 s, at most `MAX_FRAMES` (8) spread evenly over the video), `model`, `chunk_count`,
+  `gemini_requests`, `usage`, `validation`, `grounding`. Malformed/empty/schema-violating output →
+  `GEMINI_INVALID_OUTPUT` (TransientError, bounded retries → DEAD_LETTERED); a safety block →
+  FAILED `GEMINI_OUTPUT_BLOCKED`.
+- **Chunking:** lines are packed in order into chunks of at most `TRANSCRIPT_CHUNK_TOKENS` (12,000)
+  estimated tokens (≈ 3 characters per token, conservative), whole segments, no overlap. One chunk →
+  one request (a ~20-minute talk normally fits). Several chunks → one request per chunk plus one small
+  merge request (overall summary + de-duplicated key points from the chunk summaries, no transcript);
+  sections and timestamps are merged deterministically in chunk = video order. The effective chunk
+  budget is `min(TRANSCRIPT_CHUNK_TOKENS, GEMINI_TPM_LIMIT − 2,000)`, so every request fits what the
+  limiter can grant within one minute.
+- **Rate limiting:** a `Provider.GEMINI` permit (estimated input tokens) before EVERY request and
+  `settle()` with the real `prompt_token_count` afterwards (ADR-13).
+- **Errors (ADR-10 classification of the SDK's `APIError` body/headers):** 429 → `GEMINI_RATE_LIMITED`
+  (RetryInfo / Retry-After honoured, shared cooldown); daily quota → `GEMINI_QUOTA_EXHAUSTED` (resets at
+  midnight Pacific, cooldown until then); 500/503/504 and `httpx2` transport errors → transient;
+  400/401/403/402/404 → FAILED; missing key → FAILED `GEMINI_NOT_CONFIGURED`.
+- **Idempotency:** the result is stored as the stage checkpoint together with the transition in one
+  transaction before the ack (ADR-05); a redelivery after that resumes at EXTRACTING_FRAMES without
+  calling Gemini. Partial chunk results are **not** persisted: a crash or retry during SUMMARIZING
+  repeats all of its Gemini requests (each costs RPD; acceptable because a ≤ 20-minute video normally
+  needs one request).
+
+## ADR-16 EXTRACTING_FRAMES stage: real frames with yt-dlp + FFmpeg (Phase B, Part 3)
+
+- **Source:** ONE `yt-dlp` download per job (one `Provider.YOUTUBE` limiter permit) of a **video-only**
+  stream, preferring H.264: `bv*[height<=FRAME_SOURCE_MAX_HEIGHT][vcodec^=avc1]/…mp4/…/b[height<=…]`
+  (default 720p), into a private temporary directory. `retries`/`fragment_retries` = 0 (no hidden retry
+  loop; ADR-11 retries), `max_filesize` guard (`FRAME_DOWNLOAD_MAX_MB`, 1024). The stream URL is never
+  logged or stored. The 20-minute limit is already enforced by TRANSCRIBING (ADR-14).
+- **No JavaScript runtime:** verified on 2026-11-20 that `yt-dlp 2026.10.26` lists formats (24, 12
+  video-only) and downloads a stream without one; it still prints its deprecation warning. If YouTube
+  stops serving formats without a JS runtime, the download fails with "format not available" and the
+  stage degrades to text-only (below) — installing `deno` would then be the fix (not installed now:
+  not needed, ~100 MB).
+- **FFmpeg:** Debian `ffmpeg` 7.1.5 installed in the image's base stage (worker and test images;
+  `--no-install-recommends`, ≈ 430 MB). For each timestamp: `ffmpeg -ss T -i source -frames:v 1
+  -vf scale='min(FRAME_MAX_WIDTH,iw)':-2 -q:v FRAME_JPEG_QUALITY` (accurate input seek, never
+  upscaled; defaults 1280 px, q 3), then `ffprobe` must confirm a decodable MJPEG image, non-empty,
+  JPEG magic bytes, ≤ 5 MiB (Notion free-workspace upload limit). Timestamps must be finite and in
+  `[0, duration)` where duration is measured with `ffprobe` on the downloaded file.
+- **Real frames only:** the only image bytes ever stored are those FFmpeg decoded from the downloaded
+  source at that timestamp. Nothing is generated, upscaled or substituted; a failed timestamp is simply
+  omitted. Each frame keeps `timestamp_sec`, `segment_index`, the Gemini `caption`/`reason`,
+  `transcript_excerpt`, and `caption_basis = "transcript"` (the caption was written from the speech,
+  not from looking at the image), plus `image {mime_type, width, height, bytes, sha256, data_base64}`.
+- **Checkpoint:** `{requested, extracted, caption_basis, frames[], failed[{timestamp_sec, reason}],
+  source{format_id, ext, width, height, vcodec, duration_sec}}`, stored (base64 JPEG in jsonb) with the
+  transition in one transaction before the ack (ADR-05). The summarization contract is unchanged.
+- **Graceful degradation (spec §6):** each failed timestamp → job warning
+  `{"code": "FRAME_EXTRACTION_FAILED", "timestamp_sec": t, "reason": …}` (reasons:
+  `TIMESTAMP_OUT_OF_RANGE`, `FFMPEG_ERROR`, `FFMPEG_TIMEOUT`, `FFMPEG_MISSING`, `NO_OUTPUT`,
+  `EMPTY_OUTPUT`, `NOT_A_JPEG`, `UNREADABLE`, `TOO_LARGE`, `SOURCE_UNAVAILABLE`, `SOURCE_MISSING`); the
+  other frames continue. A non-retryable source problem (format not available, unexpected download
+  failure, file missing/too large) makes every timestamp such a warning and the stage still succeeds
+  (text-only). The runner already turns any warning into COMPLETED_WITH_WARNINGS at PUBLISHING.
+- **Errors raised (existing retries, ADR-10/14):** 429 / bot check → RateLimited (shared cooldown);
+  network, 403, 5xx → TransientError; video now unavailable/private/404/410/age-restricted → FAILED
+  (as in ADR-14). No timestamps → no YouTube request at all.
+- **Temporary files:** `FRAME_WORK_DIR/<pid>-<job_id>-*` is deleted in `finally` (success, error,
+  cancellation). At each stage start, directories whose owner PID is not alive (or a zombie), or that
+  are older than `FRAME_TMP_MAX_AGE_SEC` (6 h), are purged — leftovers of SIGKILLed workers.
+
+## ADR-17 PUBLISHING stage: one Notion page per job, reconciled before every write (Phase B, Part 4)
+
+- **Client:** `worker/notion.py` (`httpx==0.28.1` + `httpcore==1.0.9`, now runtime pins; they were
+  already pinned for tests). It sends `Authorization: Bearer <per-job token>` (from the encrypted
+  credential mailbox, ADR-03) and `Notion-Version: NOTION_VERSION` (2026-03-11), to
+  `NOTION_API_BASE_URL` (default `https://api.notion.com/v1`). It makes no retries of its own, and it
+  takes a `Provider.NOTION` limiter permit before EVERY request (ADR-13; connection key = SHA-256 of the
+  token, never the token). Errors go through `classify_http(Provider.NOTION, …, method=…)`:
+  429/529 → RateLimited (Retry-After); 5xx → transient with `notion_write_outcome_unknown` for writes;
+  401/403/404/400 → FAILED. Transport errors → `NOTION_UNREACHABLE` (transient; writes marked
+  uncertain). The token never appears in logs, errors or `repr`.
+- **Destination:** the job's `notion_parent_id`, else `NOTION_DEFAULT_PARENT_ID` (validated, normalised
+  UUID; empty = unset). Neither → FAILED `NOTION_PARENT_MISSING` before any request or token read.
+  Parents are pages (`{"page_id": …}`); a database ID is not supported.
+- **Page:**
+  - title = the video title (or "YouTube video <id>");
+  - a deterministic block plan:
+    - marker paragraph "Notes generated by Video Notes Agent · job <job_id> · source: <url>" (first block);
+    - Summary;
+    - Key points (bullets);
+    - Sections (heading_3 with a link to the time in the video + bullets);
+    - Key frames (only if frames were selected): a note that captions are transcript-based, one image
+      block per extracted frame (Notion File Upload API, single part: create → send multipart → attach
+      by `file_upload` id), each captioned "mm:ss (linked) — caption. Why it was chosen: reason", and a
+      note if selected frames were missing.
+  - Rich text is split into ≤ 2000-character items.
+  - Blocks are written in batches of `NOTION_BLOCKS_PER_REQUEST` (≤ 100): page creation with the first
+    batch, then appends.
+  - A job with no frames produces a text-only page. Every image has its LLM caption (constraint B).
+- **No duplicate pages (spec §6), reconciliation before every write:** each attempt first lists the
+  parent's child pages. A page with the same title whose FIRST block contains `job <job_id>` is this
+  job's page; its existing top-level blocks are counted, and only the remaining part of the plan is
+  written (appends follow plan order, so what exists is a prefix). This covers:
+  - a redelivery after a crash, before or after all writes;
+  - retries after 429;
+  - writes whose outcome is unknown (5xx after commit, lost connection).
+
+  Frames are uploaded only for image blocks still missing, immediately before attaching (unattached
+  uploads expire after 1 h; orphaned uploads from crashed attempts are harmless and cannot be
+  deleted). Pages of other jobs, including the same video, are never reused.
+- **Result:** `{notion_page_url (from Notion), frames_requested (EXTRACTING_FRAMES), frames_published
+  (image blocks actually on the page)}`. The runner validates it, and sets COMPLETED, or
+  COMPLETED_WITH_WARNINGS when there are warnings or `frames_published < frames_requested`, in one
+  transaction with the checkpoint `{notion_page_id, …result, blocks, resumed}`, before the ack.
+- **Upload rejected permanently** (4xx) → that frame is replaced by a short note and reported as warning
+  `FRAME_UPLOAD_FAILED`. A transient upload failure → retry of the stage (reconciliation prevents
+  duplicates).
+- **Known limits:**
+  - reconciliation needs one listing pass over the parent's children (paginated) per attempt;
+  - if someone edits the page between a crash and the retry, the prefix assumption can be violated
+    (more blocks than planned → FAILED `NOTION_PAGE_CONFLICT`);
+  - a database as parent is not supported;
+  - not yet verified against the real Notion API (no OAuth token yet).

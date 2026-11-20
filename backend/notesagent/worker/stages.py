@@ -3,13 +3,13 @@
 A *stage* is an async function ``(StageContext) -> StageOutput`` for one pipeline status.
 Stages must be safe to repeat: after a crash the same stage may run again.
 
-Phase 1 ships NO stage implementations (no fake or simulated stages). Real stages are
-registered in later phases:
-    TRANSCRIBING / SUMMARIZING  -> Phase 3 (YouTube + Gemini)
-    EXTRACTING_FRAMES           -> Phase 4 (ffmpeg)
-    PUBLISHING                  -> Phase 5 (Notion)
-Until then the worker marks a job FAILED with PIPELINE_STAGE_UNAVAILABLE — it never
-pretends a job completed.
+There are no fake or simulated production stages. Implemented so far:
+    TRANSCRIBING                -> worker/transcribe.py (yt-dlp + youtube-transcript-api, ADR-14)
+    SUMMARIZING                 -> worker/summarize.py (Gemini, ADR-15)
+    EXTRACTING_FRAMES           -> worker/frames.py (yt-dlp download + FFmpeg, ADR-16)
+    PUBLISHING                  -> worker/publish.py (Notion, ADR-17)
+A job that reaches a stage missing from a registry is marked FAILED with PIPELINE_STAGE_UNAVAILABLE —
+the worker never pretends a job completed.
 """
 from __future__ import annotations
 
@@ -49,6 +49,15 @@ Stage = Callable[[StageContext], Awaitable[StageOutput]]
 StageRegistry = Mapping[JobStatus, Stage]
 
 
-def build_stage_registry() -> dict[JobStatus, Stage]:
-    """Production stages. Empty in Phase 1 by design."""
-    return {}
+def build_stage_registry(settings=None, *, youtube=None, gemini=None) -> dict[JobStatus, Stage]:
+    """Production stages. ``youtube`` / ``gemini`` replace the real clients (tests only)."""
+    from notesagent.common.config import get_settings
+    from notesagent.worker.frames import make_frames_stage            # lazy: avoids an import cycle
+    from notesagent.worker.publish import make_publish_stage
+    from notesagent.worker.summarize import make_summarize_stage
+    from notesagent.worker.transcribe import make_transcribe_stage
+    settings = settings or get_settings()
+    return {JobStatus.TRANSCRIBING: make_transcribe_stage(settings, youtube),
+            JobStatus.SUMMARIZING: make_summarize_stage(settings, gemini),
+            JobStatus.EXTRACTING_FRAMES: make_frames_stage(settings, youtube),
+            JobStatus.PUBLISHING: make_publish_stage(settings)}

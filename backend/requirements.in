@@ -8,3 +8,10 @@ aio-pika
 redis
 cryptography
 python-json-logger
+# Phase B Part 1 (ADR-14), worker TRANSCRIBING stage: metadata/duration and timestamped transcript.
+yt-dlp
+youtube-transcript-api
+# Phase B Part 2 (ADR-15), worker SUMMARIZING stage: official Gemini SDK.
+google-genai
+# Phase B Part 4 (ADR-17), worker PUBLISHING stage: Notion REST API client.
+httpx

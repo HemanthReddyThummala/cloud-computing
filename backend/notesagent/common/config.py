@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import socket
+import uuid
 
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -74,6 +75,51 @@ class Settings(BaseSettings):
     # Shared cooldown after a 429 that carries no Retry-After.
     rate_limit_default_cooldown_sec: float = Field(10.0, gt=0, le=3600)
 
+    # TRANSCRIBING stage (ADR-14). Constraint A: longer videos are rejected (exactly the max is accepted).
+    max_video_duration_sec: int = Field(1200, ge=1)
+    # Preferred transcript languages, highest priority first; any other available transcript is used
+    # only if none of these exists.
+    transcript_languages: str = "en"
+    # Timeout for each YouTube HTTP request made by the libraries.
+    youtube_request_timeout_sec: float = Field(30.0, gt=0, le=300)
+
+    # SUMMARIZING stage (ADR-06, ADR-15). Free tier only; the key is never logged (SecretStr).
+    gemini_api_key: SecretStr | None = None
+    gemini_model: str = "gemini-3.8-flash"
+    gemini_thinking_level: str = "low"
+    gemini_request_timeout_sec: float = Field(120.0, gt=0, le=600)
+    gemini_max_output_tokens: int = Field(8192, ge=256, le=65_536)
+    # Estimated transcript tokens per Gemini request; longer transcripts are split into chunks.
+    transcript_chunk_tokens: int = Field(12_000, ge=500)
+    # Upper bound of important timestamps (= frames to extract later) per video.
+    max_frames: int = Field(8, ge=0, le=30)
+
+    # EXTRACTING_FRAMES stage (ADR-16).
+    frame_source_max_height: int = Field(720, ge=144, le=2160)     # downloaded video-only stream
+    frame_max_width: int = Field(1280, ge=160, le=3840)            # stored JPEG width (never upscaled)
+    frame_jpeg_quality: int = Field(3, ge=2, le=31)                # FFmpeg -q:v (2 = best, 31 = worst)
+    frame_ffmpeg_timeout_sec: float = Field(60.0, gt=0, le=600)
+    frame_download_max_mb: int = Field(1024, ge=10, le=10_240)     # yt-dlp max_filesize guard
+    frame_work_dir: str = "/tmp/notesagent-frames"
+    frame_tmp_max_age_sec: float = Field(6 * 3600, gt=0)            # leftovers older than this are purged
+
+    # PUBLISHING stage (ADR-07, ADR-17). The per-job OAuth token comes from the credential mailbox.
+    notion_version: str = "2026-03-11"
+    notion_default_parent_id: str | None = None                    # page ID, used when the job has none
+    notion_api_base_url: str = "https://api.notion.com/v1"         # tests point this to a local fake
+    notion_request_timeout_sec: float = Field(30.0, gt=0, le=300)
+    notion_blocks_per_request: int = Field(100, ge=1, le=100)      # Notion: <= 100 children per request
+
+    @field_validator("notion_default_parent_id", mode="before")
+    @classmethod
+    def _valid_parent_id(cls, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        text = str(value).strip().replace("-", "")
+        if len(text) != 32 or any(c not in "0123456789abcdefABCDEF" for c in text):
+            raise ValueError("must be a Notion page ID (32 hex characters, dashes optional)")
+        return str(uuid.UUID(text))
+
     @property
     def effective_worker_id(self) -> str:
         return self.worker_id or f"{socket.gethostname()}-{os.getpid()}"
@@ -96,6 +142,32 @@ class Settings(BaseSettings):
                 and self.audit_queue_delivery_limit <= self.queue_delivery_limit + 1):
             raise ValueError("AUDIT_QUEUE_DELIVERY_LIMIT must be greater than QUEUE_DELIVERY_LIMIT + 1")
         return self
+
+    @field_validator("gemini_thinking_level")
+    @classmethod
+    def _valid_thinking_level(cls, value: str) -> str:
+        if value.strip().lower() not in {"minimal", "low", "medium", "high"}:
+            raise ValueError("must be one of minimal, low, medium, high")
+        return value.strip().lower()
+
+    @field_validator("gemini_model")
+    @classmethod
+    def _valid_model(cls, value: str) -> str:
+        if not value.strip() or not all(c.isalnum() or c in "-._" for c in value.strip()):
+            raise ValueError("must be a Gemini model name such as gemini-3.8-flash")
+        return value.strip()
+
+    @field_validator("transcript_languages")
+    @classmethod
+    def _valid_languages(cls, value: str) -> str:
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        if not parts or not all(p.replace("-", "").isalnum() and len(p) <= 16 for p in parts):
+            raise ValueError("must be a comma-separated list of language codes, e.g. 'en' or 'en,de'")
+        return ",".join(parts)
+
+    @property
+    def transcript_language_list(self) -> list[str]:
+        return self.transcript_languages.split(",")
 
     @property
     def effective_audit_queue_delivery_limit(self) -> int:
