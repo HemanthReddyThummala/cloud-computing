@@ -270,7 +270,13 @@ def _gemini(status: int, doc: dict[str, Any] | None, header_delay: float | None,
         delay = header_delay if header_delay is not None else _gemini_retry_delay(error, now, cap)
         return RateLimited("GEMINI_RATE_LIMITED", "Gemini is rate limiting requests.", provider=p,
                            retry_after_sec=delay, detail=_detail(status, code))
-    if status in (500, 503, 504):
+    if status in (503, 504):
+        # UNAVAILABLE / DEADLINE_EXCEEDED. A valid Retry-After (header, else RetryInfo; capped) is kept
+        # so the retry policy can honour it (ADR-21).
+        delay = header_delay if header_delay is not None else _gemini_retry_delay(error, now, cap)
+        return TransientError(f"GEMINI_HTTP_{status}", "Gemini is temporarily unavailable.", provider=p,
+                              detail=_detail(status, code, retry_after_sec=delay))
+    if status == 500:
         return TransientError(f"GEMINI_HTTP_{status}", "Gemini is temporarily unavailable.", provider=p,
                               detail=_detail(status, code))
     fatal = {400: ("GEMINI_BAD_REQUEST", "Gemini rejected the request as invalid."),

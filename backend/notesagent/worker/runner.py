@@ -390,8 +390,10 @@ class JobWorker:
         """Fatal -> FAILED. Retryable -> one transaction that counts the attempt and schedules a retry
         (raises _RetryScheduled) or dead-letters the job (returns the terminal row)."""
         error = classify_exception(Provider.GENERIC, exc)
+        provider_status = retry_policy.provider_status(error)       # ADR-21: e.g. 503 / UNAVAILABLE
         if not error.retryable:
-            log.warning("stage failed permanently", extra={"job_id": str(job_id), "stage": status, "code": error.code})
+            log.warning("stage failed permanently",
+                        extra={"job_id": str(job_id), "stage": status, "code": error.code, **provider_status})
             return await jobs_repo.transition(conn, job_id, expected=status, new=JobStatus.FAILED,
                                               worker_id=self.worker_id,
                                               error={"code": error.code, "message": error.message})
@@ -404,7 +406,7 @@ class JobWorker:
         if isinstance(plan, retry_policy.DeadLetterPlan):
             log.error("retry budget exhausted; job dead-lettered",
                       extra={"job_id": str(job_id), "stage": status, "code": error.code, "attempt": plan.attempt,
-                             "budget": error.budget.value})
+                             "budget": error.budget.value, **provider_status})
             return await jobs_repo.dead_letter(conn, job_id, expected=status, column=plan.attempt_column,
                                                attempt=plan.attempt, error=plan.error, event_id=plan.event_id,
                                                worker_id=self.worker_id)
@@ -416,7 +418,8 @@ class JobWorker:
         log.warning("stage failed; retry scheduled",
                     extra={"job_id": str(job_id), "stage": status, "code": error.code, "attempt": plan.attempt,
                            "max_attempts": plan.max_attempts, "delay_sec": plan.delay_sec,
-                           "budget": error.budget.value, "event_id": str(plan.event_id)})
+                           "budget": error.budget.value, "event_id": str(plan.event_id),
+                           "backoff": plan.retry_doc.get("backoff"), **provider_status})
         raise _RetryScheduled()
 
     # ------------------------------------------------------------ credential mailbox

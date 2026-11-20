@@ -18,6 +18,8 @@ os.environ["REDIS_URL"] = os.environ["TEST_REDIS_URL"]
 os.environ["JOB_PAYLOAD_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 os.environ["RABBITMQ_MANAGEMENT_URL"] = os.environ["TEST_RABBITMQ_MGMT_URL"]
 os.environ["BACKOFF_SCHEDULE_SEC"] = "2,4,8"
+# Short, DISTINCT Gemini 503/504 schedule (ADR-21) so tests can tell which schedule was applied.
+os.environ["GEMINI_UNAVAILABLE_BACKOFF_SEC"] = "3,6,12"
 os.environ["LEGACY_DRAIN_INTERVAL_SEC"] = "0.5"
 os.environ["WORKER_HEARTBEAT_FILE"] = "/tmp/test-worker-heartbeat"
 os.environ["OUTBOX_HEARTBEAT_FILE"] = "/tmp/test-outbox-heartbeat"

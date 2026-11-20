@@ -651,3 +651,53 @@ why, and what it does **not** guarantee.
   - The popup reads `jobs` from storage and re-renders on `storage.onChanged`. No `innerHTML`.
 - **Permissions unchanged** (`identity`, `storage`, host `http://localhost:8000/*`). The content script
   is declared for `https://www.youtube.com/*` only.
+
+## ADR-21 Gemini 503/504 handling: keep the provider status, longer backoff, 300 s deadline (2026-11-21)
+
+**Context:**
+- Two real jobs (D26sUZ6DHNQ) dead-lettered at SUMMARIZING after 503, 503, 504, 503, 503 within about
+  6 minutes.
+- A controlled single request with a tiny transcript then also got **503 `UNAVAILABLE`**: a Google-side
+  availability problem.
+- Evidence gaps found by the diagnosis (`docs/session_logs/gemini_integration_root_cause_diagnosis.md`,
+  `gemini_controlled_tests_T1_T2.md`):
+  - (C1) our 120 s timeout is sent to Google as the server deadline (`X-Server-Timeout`), causing the
+    504s;
+  - (C2) Google's `error.status` was classified but never persisted;
+  - (C3) the generic 10/30/90 s backoff is too short for a provider outage and spends daily quota;
+  - (C4) the popup showed the raw code.
+
+**Decision** (extends ADR-10/11; nothing else changes):
+1. **Sanitized provider status is kept.**
+   - `retry_policy.provider_status()` copies only `http_status` (int) and `provider_code` (already
+     `_safe_code`-filtered, ≤ 64 chars: Google's `error.status` such as `UNAVAILABLE`, or else the
+     numeric `error.code`).
+   - It goes into the retry doc, the `retry_scheduled` event (`http_status`, `provider_code`,
+     `backoff`), the terminal error (`last_http_status`, `last_provider_code`), the `dead_lettered`
+     event, and the worker's "stage failed …" log lines.
+   - Never message text, headers or keys.
+   - `GET /jobs/{id}` → `retry` is unchanged; the terminal `error` gains the two optional fields.
+2. **Gemini 503/504 backoff** = `GEMINI_UNAVAILABLE_BACKOFF_SEC` (default **60,180,600**, last step
+   repeats; worker only). It applies only to `GEMINI_HTTP_503` / `GEMINI_HTTP_504` (provider GEMINI).
+   - A valid Retry-After on them (header, else `RetryInfo`; capped at `RETRY_AFTER_MAX_SEC`, default
+     3600) raises the delay: `max(step, retry_after)`. Invalid values are ignored.
+   - Still bounded by `MAX_ATTEMPTS` (default 5 → 60 + 180 + 600 + 600 s ≈ 24 min), then
+     DEAD_LETTERED + DLQ copy exactly as before.
+   - These delays are **not** added to the delay-queue topology. They are reached through the existing
+     `jobs.retry.*` queues by uncounted hops (ADR-11), so deploying declares no new queues.
+   - 503/504 still set **no** shared cooldown (only 429/quota do, ADR-13).
+   - YouTube, Notion, Gemini 500 and the network keep `BACKOFF_SCHEDULE_SEC`.
+3. **Timeout:** `GEMINI_REQUEST_TIMEOUT_SEC` default **300** (1–600), now passed to the worker by
+   Compose. `GeminiClient` passes it to `HttpOptions(timeout=ms)`. The SDK uses it both as the request
+   timeout and as `X-Server-Timeout` (verified by a unit test through the real SDK with a mock
+   transport). The RabbitMQ consumer timeout is 1 h, so it is unaffected.
+4. **Extension:**
+   - `reasonText()` maps `*_HTTP_503` / `UNAVAILABLE` → "… is temporarily unavailable (overloaded)",
+     `*_HTTP_504` / `DEADLINE_EXCEEDED` → "… took too long to respond", other 5xx → "temporary server
+     problem";
+   - exhausted 5xx retries add "Please try again later.";
+   - `last_provider_code` is passed through only if it matches `^[A-Z][A-Z0-9_]{0,63}$`.
+
+**Not changed:** the model, the key, the free-tier limits, the request content, the job state machine.
+These changes do not make Gemini answer while it reports `UNAVAILABLE`; they make such episodes
+visible, survivable for longer and cheaper in quota.

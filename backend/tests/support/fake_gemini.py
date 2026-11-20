@@ -9,6 +9,8 @@ Env:
   FAKE_GEMINI   ok (default) | invalid_json | invalid_json_once | schema_mismatch | blocked
                 | rate_limited_once:<sec> | quota | server_once | network_once | leaky_once
                 | ungrounded (segment numbers outside the prompt)
+                | deadline_once (504 DEADLINE_EXCEEDED) | unavailable_always (503 UNAVAILABLE on every call)
+                | unavailable_retry_after_once:<sec> (503 UNAVAILABLE with a Retry-After header)
   FAKE_GEMINI_GATE=1   block inside the call until FIXTURE_DIR/release.gemini exists
 """
 from __future__ import annotations
@@ -25,10 +27,18 @@ from notesagent.worker.gemini import GeminiReply
 _SEGMENT = re.compile(r"^\[#(\d+) ", re.M)
 
 
-def api_error(code: int, body: dict, cls_name: str | None = None):
+def api_error(code: int, body: dict, cls_name: str | None = None, headers: dict | None = None):
     from google.genai import errors
     cls = getattr(errors, cls_name) if cls_name else (errors.ClientError if code < 500 else errors.ServerError)
-    return cls(code, body)
+    if headers is None:
+        return cls(code, body)
+    import httpx2                                     # a real response object carrying the headers
+    return cls(code, body, httpx2.Response(code, headers=headers, json=body))
+
+
+UNAVAILABLE_BODY = {"error": {"code": 503, "status": "UNAVAILABLE",
+                              "message": "The model is overloaded. SECRET-LIKE-UPSTREAM-TEXT"}}
+DEADLINE_BODY = {"error": {"code": 504, "status": "DEADLINE_EXCEEDED", "message": "Deadline expired."}}
 
 
 def rate_limited_body(seconds: str) -> dict:
@@ -80,6 +90,12 @@ class FakeGemini:
             raise api_error(429, QUOTA_BODY)
         if s == "server_once" and n == 1:
             raise api_error(503, {"error": {"code": 503, "status": "UNAVAILABLE", "message": "overloaded"}})
+        if s == "deadline_once" and n == 1:
+            raise api_error(504, DEADLINE_BODY)
+        if s == "unavailable_always":
+            raise api_error(503, UNAVAILABLE_BODY)
+        if s.startswith("unavailable_retry_after_once") and n == 1:
+            raise api_error(503, UNAVAILABLE_BODY, headers={"Retry-After": s.split(":")[1]})
         if s == "network_once" and n == 1:
             import httpx2
             raise httpx2.ConnectError("connection refused")

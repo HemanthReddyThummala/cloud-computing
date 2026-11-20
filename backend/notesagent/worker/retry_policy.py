@@ -14,6 +14,10 @@ Rules (approved P3-D1..D6):
     max(step, retry_after_sec). QuotaExhausted uses the normal step (no waiting until reset).
   * The deadline ``next_attempt_at`` stores the actually selected delay. Long delays are reached by
     delay-queue hops; a stage never runs before the deadline.
+  * ADR-21: Gemini 503 (UNAVAILABLE) / 504 (DEADLINE_EXCEEDED) use GEMINI_UNAVAILABLE_BACKOFF_SEC
+    instead, and a valid (already capped) Retry-After on them raises the delay. Same MAX_ATTEMPTS.
+  * ADR-21: the provider's sanitized HTTP status and status code (e.g. 503 / UNAVAILABLE) are kept in
+    the retry document and the terminal error (never message text, headers or keys).
 """
 from __future__ import annotations
 
@@ -23,9 +27,10 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from notesagent.common.config import Settings
-from notesagent.common.errors import PipelineError, QuotaExhausted, RateLimited, RetryBudget
+from notesagent.common.errors import PipelineError, Provider, QuotaExhausted, RateLimited, RetryBudget
 
 ATTEMPT_COLUMNS = {RetryBudget.PROVIDER: "attempts", RetryBudget.INFRASTRUCTURE: "infra_attempts"}
+GEMINI_UNAVAILABLE_CODES = frozenset({"GEMINI_HTTP_503", "GEMINI_HTTP_504"})
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,26 @@ def choose_bucket(remaining_sec: float, buckets: list[int]) -> int:
     return fitting[-1] if fitting else ordered[0]
 
 
+def is_gemini_unavailable(error: PipelineError) -> bool:
+    return error.provider is Provider.GEMINI and error.code in GEMINI_UNAVAILABLE_CODES
+
+
+def provider_status(error: PipelineError) -> dict[str, Any]:
+    """The provider's sanitized HTTP status / status code (already whitelisted by PipelineError)."""
+    out: dict[str, Any] = {}
+    if isinstance(error.detail.get("http_status"), int):
+        out["http_status"] = error.detail["http_status"]
+    if isinstance(error.detail.get("provider_code"), str):
+        out["provider_code"] = error.detail["provider_code"]
+    return out
+
+
+def _valid_delay(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value <= 0:
+        return None
+    return float(value)
+
+
 def plan_failure(job: dict[str, Any], error: PipelineError, settings: Settings, now: datetime) -> RetryPlan | DeadLetterPlan:
     if not error.retryable:
         raise ValueError("plan_failure is only for retryable errors")
@@ -66,6 +91,7 @@ def plan_failure(job: dict[str, Any], error: PipelineError, settings: Settings, 
     column = ATTEMPT_COLUMNS[error.budget]
     attempt = int(job[column]) + 1
     limit = settings.infra_max_attempts if infra else settings.max_attempts
+    status = provider_status(error)
 
     if attempt >= limit:
         terminal: dict[str, Any] = {
@@ -75,12 +101,23 @@ def plan_failure(job: dict[str, Any], error: PipelineError, settings: Settings, 
             "last_error_code": error.code,
             "attempts": attempt,
         }
+        if "http_status" in status:
+            terminal["last_http_status"] = status["http_status"]
+        if "provider_code" in status:
+            terminal["last_provider_code"] = status["provider_code"]
         if isinstance(error, QuotaExhausted):
             terminal["resets_at"] = error.resets_at.isoformat()      # clarification A: keep the reset time
         return DeadLetterPlan(column, attempt, terminal, uuid.uuid4())
 
+    schedule_name = "default"
     if infra:
         delay = float(settings.infra_retry_delay_sec)
+    elif is_gemini_unavailable(error):
+        schedule_name = "gemini_unavailable"
+        delay = float(backoff_step(attempt, settings.gemini_unavailable_backoff_delays))
+        retry_after = _valid_delay(error.detail.get("retry_after_sec"))   # capped by the classifier
+        if retry_after is not None:
+            delay = max(delay, retry_after)
     else:
         delay = float(backoff_step(attempt, settings.backoff_delays))
         if isinstance(error, RateLimited) and error.retry_after_sec is not None:
@@ -96,6 +133,8 @@ def plan_failure(job: dict[str, Any], error: PipelineError, settings: Settings, 
         "provider": error.provider.value if error.provider else None,
         "delay_sec": delay,
         "next_attempt_at": deadline.isoformat(),
+        "backoff": schedule_name,
+        **status,
     }
     if isinstance(error, QuotaExhausted):
         doc["resets_at"] = error.resets_at.isoformat()

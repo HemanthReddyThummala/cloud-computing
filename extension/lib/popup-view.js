@@ -24,12 +24,19 @@ const ERRORS = {
 
 const PROVIDERS = { NOTION: "Notion", GEMINI: "the AI model", YOUTUBE: "YouTube" };
 
-/** Readable text for a retry/last-error reason code such as GEMINI_RATE_LIMITED or NOTION_UNREACHABLE. */
-export function reasonText(code) {
+/**
+ * Readable text for a retry/last-error reason code such as GEMINI_RATE_LIMITED or NOTION_UNREACHABLE.
+ * ``providerCode`` is the provider's sanitized status (e.g. Google's UNAVAILABLE), when the gateway has it.
+ */
+export function reasonText(code, providerCode = null) {
   if (typeof code !== "string") return "a temporary problem";
   const [prefix] = code.split("_");
   const who = PROVIDERS[prefix];
   if (!who) return code;
+  // ADR-21: provider HTTP 5xx (GEMINI_HTTP_503 = Google UNAVAILABLE, 504 = DEADLINE_EXCEEDED)
+  if (/_HTTP_503$/.test(code) || providerCode === "UNAVAILABLE") return `${who} is temporarily unavailable (overloaded)`;
+  if (/_HTTP_504$/.test(code) || providerCode === "DEADLINE_EXCEEDED") return `${who} took too long to respond`;
+  if (/_HTTP_5\d\d$/.test(code)) return `${who} had a temporary server problem`;
   if (/_(DAILY_LIMIT_REACHED|QUOTA_EXHAUSTED)$/.test(code)) return `${who}'s daily quota is used up`;
   if (/_(RATE_LIMITED|LOCAL_RATE_LIMIT|COOLDOWN_ACTIVE|SERVICE_OVERLOAD|BLOCKED)$/.test(code)) return `${who} is limiting requests`;
   if (/_(UNREACHABLE|TLS_ERROR|TLS_CONNECTION_DROPPED)$/.test(code)) return `${who} could not be reached`;
@@ -66,7 +73,9 @@ function errorText(error) {
   if (!error) return "Unknown error.";
   const base = ERRORS[error.code] ?? error.message ?? `Error ${error.code ?? "unknown"}.`;
   if (error.code === "RETRIES_EXHAUSTED" && error.lastErrorCode) {
-    return `${base} Last cause: ${reasonText(error.lastErrorCode)}.`;
+    const text = `${base} Last cause: ${reasonText(error.lastErrorCode, error.lastProviderCode)}.`;
+    // A provider outage is not the video's fault: say that a later retry can succeed.
+    return /_HTTP_5\d\d$/.test(error.lastErrorCode) ? `${text} Please try again later.` : text;
   }
   return base;
 }

@@ -51,6 +51,8 @@ export function sanitizeStatus(data) {
   const error = data.error && typeof data.error === "object" ? {
     code: str(data.error.code, 64), message: str(data.error.message),
     lastErrorCode: str(data.error.last_error_code, 64), resetsAt: str(data.error.resets_at, 64),
+    // ADR-21: provider's sanitized status (e.g. Google UNAVAILABLE); only an UPPER_CASE code is kept
+    lastProviderCode: /^[A-Z][A-Z0-9_]{0,63}$/.test(data.error.last_provider_code ?? "") ? data.error.last_provider_code : null,
   } : null;
   const retry = data.retry && typeof data.retry === "object" ? {
     reason: str(data.retry.reason, 64), attempt: num(data.retry.attempt), maxAttempts: num(data.retry.max_attempts),

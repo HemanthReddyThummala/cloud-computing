@@ -126,7 +126,11 @@ async def schedule_retry(conn: AsyncConnection, job_id: uuid.UUID, *, expected: 
         await insert_event(conn, job_id=job_id, event_type="retry_scheduled", from_status=row["status"],
                            to_status=row["status"], worker_id=worker_id,
                            detail={"event_id": str(event_id), "attempt": attempt, "budget": retry_doc.get("budget"),
-                                   "reason_code": retry_doc.get("reason_code"), "delay_sec": retry_doc.get("delay_sec")})
+                                   "reason_code": retry_doc.get("reason_code"), "delay_sec": retry_doc.get("delay_sec"),
+                                   # ADR-21: sanitized provider status (e.g. 503 / UNAVAILABLE), never text
+                                   "http_status": retry_doc.get("http_status"),
+                                   "provider_code": retry_doc.get("provider_code"),
+                                   "backoff": retry_doc.get("backoff")})
         await insert_outbox(conn, event_id=event_id, job_id=job_id, event_type="job.retry",
                             payload={"event_id": str(event_id), "event_type": "job.retry", "job_id": str(job_id),
                                      "schema": 1},
@@ -142,7 +146,9 @@ async def dead_letter(conn: AsyncConnection, job_id: uuid.UUID, *, expected: Job
         await _bump_attempts(conn, job_id, expected=expected, column=column, attempt=attempt, retry=None)
         row = await transition(conn, job_id, expected=expected, new=JobStatus.DEAD_LETTERED, worker_id=worker_id,
                                event_type="dead_lettered", error=error,
-                               detail={"attempt": attempt, "last_error_code": error.get("last_error_code")})
+                               detail={"attempt": attempt, "last_error_code": error.get("last_error_code"),
+                                       "last_http_status": error.get("last_http_status"),
+                                       "last_provider_code": error.get("last_provider_code")})
         await insert_outbox(conn, event_id=event_id, job_id=job_id, event_type="job.dead_lettered",
                             payload={"event_id": str(event_id), "event_type": "job.dead_lettered",
                                      "job_id": str(job_id), "last_error_code": error.get("last_error_code"),

@@ -198,6 +198,18 @@ text-only page if no frame could be captured):
 `last_error_code` is the classified cause of the final failure; `resets_at` appears only when that cause
 was a daily quota (absolute time, not capped).
 
+When the last failure was a provider HTTP response (ADR-21), two optional fields give its sanitized
+status, never message text:
+
+```json
+"error": { "code": "RETRIES_EXHAUSTED", "message": "...", "attempts": 5,
+           "last_error_code": "GEMINI_HTTP_503", "last_http_status": 503, "last_provider_code": "UNAVAILABLE" }
+```
+
+Gemini 503 (`UNAVAILABLE`) and 504 (`DEADLINE_EXCEEDED`) are retried with `GEMINI_UNAVAILABLE_BACKOFF_SEC`
+(default 60, 180, 600 s; a valid Retry-After raises the delay) instead of `BACKOFF_SCHEDULE_SEC`. While the
+job waits, `retry.reason` is `GEMINI_HTTP_503` / `GEMINI_HTTP_504`.
+
 **DEAD_LETTERED by the broker → 200** (RabbitMQ dead-lettered the job message itself: processing it
 repeatedly crashed the workers, or the message was unreadable; ADR-12)
 

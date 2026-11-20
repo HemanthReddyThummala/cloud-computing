@@ -140,3 +140,43 @@ test("popup: reason codes become readable text", () => {
   assert.equal(reasonText("SOMETHING_ELSE"), "SOMETHING_ELSE");
   assert.equal(reasonText(undefined), "a temporary problem");
 });
+
+// ------------------------------------------------------------------ ADR-21: provider 5xx wording
+test("popup: Gemini 503 / UNAVAILABLE after exhausted retries is clear and suggests a later retry", () => {
+  const view = describeJob({ ...base, status: "DEAD_LETTERED", lastStage: "SUMMARIZING",
+    error: { code: "RETRIES_EXHAUSTED", message: "raw backend text", lastErrorCode: "GEMINI_HTTP_503",
+      lastProviderCode: "UNAVAILABLE" } });
+  assert.equal(view.headline, "Failed after retries");
+  assert.deepEqual(view.details, ["Processing kept failing and was stopped after several attempts. "
+    + "Last cause: the AI model is temporarily unavailable (overloaded). Please try again later."]);
+  assert.ok(!view.details[0].includes("GEMINI_HTTP_503") && !view.details[0].includes("{"));
+  assert.deepEqual(stepStates(view).slice(0, 3), ["Queued:done", "Transcribing:done", "Summarizing:failed"]);
+});
+
+test("popup: Gemini 504, other 5xx, provider code only, and non-5xx causes", () => {
+  const dead = (lastErrorCode, lastProviderCode = null) => describeJob({ ...base, status: "DEAD_LETTERED",
+    error: { code: "RETRIES_EXHAUSTED", lastErrorCode, lastProviderCode } }).details[0];
+  assert.match(dead("GEMINI_HTTP_504"), /Last cause: the AI model took too long to respond\. Please try again later\.$/);
+  assert.match(dead("GEMINI_HTTP_500"), /the AI model had a temporary server problem\. Please try again later\.$/);
+  assert.match(dead("NOTION_HTTP_503"), /Last cause: Notion is temporarily unavailable \(overloaded\)/);
+  assert.match(dead("GEMINI_UNEXPECTED_RESPONSE", "UNAVAILABLE"), /the AI model is temporarily unavailable/);
+  assert.match(dead("GEMINI_DAILY_LIMIT_REACHED"), /daily quota is used up\.$/);           // no "try again" hint
+  assert.match(dead("GEMINI_INVALID_OUTPUT"), /Last cause: GEMINI_INVALID_OUTPUT\.$/);       // unchanged fallback
+});
+
+test("popup: a job waiting after a Gemini 503 is shown as still processing with the reason", () => {
+  const view = describeJob({ ...base, status: "SUMMARIZING", lastStage: "SUMMARIZING",
+    retry: { reason: "GEMINI_HTTP_503", attempt: 2, maxAttempts: 5 } });
+  assert.equal(view.tone, "wait");
+  assert.equal(view.finished, false);
+  assert.deepEqual(view.details,
+    ["Waiting to retry: the AI model is temporarily unavailable (overloaded) (attempt 2 of 5). Still processing."]);
+});
+
+test("popup: reasonText maps provider HTTP codes", () => {
+  assert.equal(reasonText("GEMINI_HTTP_503"), "the AI model is temporarily unavailable (overloaded)");
+  assert.equal(reasonText("GEMINI_HTTP_504"), "the AI model took too long to respond");
+  assert.equal(reasonText("YOUTUBE_HTTP_502"), "YouTube had a temporary server problem");
+  assert.equal(reasonText("GEMINI_HTTP_400"), "GEMINI_HTTP_400");
+  assert.equal(reasonText("GEMINI_SOMETHING", "DEADLINE_EXCEEDED"), "the AI model took too long to respond");
+});

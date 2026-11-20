@@ -88,7 +88,12 @@ class Settings(BaseSettings):
     gemini_api_key: SecretStr | None = None
     gemini_model: str = "gemini-3.8-flash"
     gemini_thinking_level: str = "low"
-    gemini_request_timeout_sec: float = Field(120.0, gt=0, le=600)
+    # Per-request timeout. The SDK also sends it to Google as the server deadline (X-Server-Timeout),
+    # so a too-short value turns slow generations into HTTP 504 (2026-11-20 diagnosis, ADR-21).
+    gemini_request_timeout_sec: float = Field(300.0, gt=0, le=600)
+    # Backoff for Gemini 503 (UNAVAILABLE) / 504 (DEADLINE_EXCEEDED) only (ADR-21); last step repeats.
+    # Other errors keep BACKOFF_SCHEDULE_SEC. Reached through the existing delay queues (uncounted hops).
+    gemini_unavailable_backoff_sec: str = "60,180,600"
     gemini_max_output_tokens: int = Field(8192, ge=256, le=65_536)
     # Estimated transcript tokens per Gemini request; longer transcripts are split into chunks.
     transcript_chunk_tokens: int = Field(12_000, ge=500)
@@ -163,7 +168,7 @@ class Settings(BaseSettings):
     def credential_ttl_ms(self) -> int:
         return int(self.credential_ttl_hours * 3600 * 1000)
 
-    @field_validator("backoff_schedule_sec")
+    @field_validator("backoff_schedule_sec", "gemini_unavailable_backoff_sec")
     @classmethod
     def _valid_schedule(cls, value: str) -> str:
         parts = [p.strip() for p in value.split(",")]
@@ -214,6 +219,11 @@ class Settings(BaseSettings):
     def backoff_delays(self) -> list[int]:
         """Backoff steps in seconds; the last step repeats for later attempts."""
         return [int(p) for p in self.backoff_schedule_sec.split(",")]
+
+    @property
+    def gemini_unavailable_backoff_delays(self) -> list[int]:
+        """Backoff steps for Gemini 503/504; NOT added to the delay-queue set (reached by hops)."""
+        return [int(p) for p in self.gemini_unavailable_backoff_sec.split(",")]
 
     @property
     def delay_queue_seconds(self) -> list[int]:

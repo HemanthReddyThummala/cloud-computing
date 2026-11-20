@@ -386,3 +386,13 @@ test("helpers: videoIdFromUrl and sanitizeStatus", () => {
   assert.equal(s.status, "TRANSCRIBING");
   assert.equal(s.extra_field, undefined);
 });
+
+test("sanitizeStatus keeps only a safe last_provider_code (ADR-21)", () => {
+  const dead = (code) => sanitizeStatus(statusBody("j", { jobStatus: "DEAD_LETTERED", error: {
+    code: "RETRIES_EXHAUSTED", message: "m", last_error_code: "GEMINI_HTTP_503", last_http_status: 503,
+    last_provider_code: code } })).error;
+  assert.equal(dead("UNAVAILABLE").lastProviderCode, "UNAVAILABLE");
+  assert.equal(dead("<b>x</b>").lastProviderCode, null);
+  assert.equal(dead(undefined).lastProviderCode, null);
+  assert.equal(dead("UNAVAILABLE").lastErrorCode, "GEMINI_HTTP_503");
+});

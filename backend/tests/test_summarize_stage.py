@@ -125,6 +125,64 @@ def test_server_error_and_network_error_are_retried(api, db, procs, fx):
         procs.stop_all()
 
 
+# ===================================================================== ADR-21: Gemini 503 / 504 handling
+def retry_events(db, job_id):
+    return [e["detail"] for e in events(db, job_id) if e["event_type"] == "retry_scheduled"]
+
+
+def test_gemini_503_and_504_keep_the_sanitized_status_and_use_the_gemini_schedule(api, db, procs, fx):
+    for scenario, status, google in (("server_once", 503, "UNAVAILABLE"), ("deadline_once", 504, "DEADLINE_EXCEEDED")):
+        for p in fx.glob("call.*"):
+            p.unlink()
+        job_id = submit_ok(api)
+        procs.start(f"publisher-{scenario}", "notesagent.outbox")
+        start(procs, fx, name=f"worker-{scenario}", FAKE_GEMINI=scenario, FAKE_YT_WITH_FIXTURES="1")
+        row = wait_for_status(db, job_id, TERMINAL, timeout=60)
+        assert (row["status"], row["attempts"]) == ("COMPLETED", 1), scenario
+        [detail] = retry_events(db, job_id)
+        assert detail["reason_code"] == f"GEMINI_HTTP_{status}"
+        assert (detail["http_status"], detail["provider_code"]) == (status, google)
+        assert detail["backoff"] == "gemini_unavailable" and detail["delay_sec"] == 3   # GEMINI_UNAVAILABLE_BACKOFF_SEC[0]
+        logs = procs.all_logs()
+        assert f'"provider_code": "{google}"' in logs and "SECRET-LIKE-UPSTREAM-TEXT" not in logs
+        procs.stop_all()
+
+
+def test_gemini_503_retry_after_raises_the_delay(api, db, procs, fx):
+    job_id = submit_ok(api)
+    procs.start("publisher", "notesagent.outbox")
+    start(procs, fx, FAKE_GEMINI="unavailable_retry_after_once:7", FAKE_YT_WITH_FIXTURES="1")
+    retry = wait_until(lambda: job(db, job_id)["retry"], timeout=30, what="retry scheduled")
+    assert retry["reason_code"] == "GEMINI_HTTP_503" and retry["delay_sec"] == 7          # max(3, Retry-After 7)
+    assert api.get(f"/jobs/{job_id}").json()["retry"] == {                              # API view unchanged
+        "reason": "GEMINI_HTTP_503", "attempt": 1, "max_attempts": 5, "next_attempt_at": retry["next_attempt_at"]}
+    assert redis.Redis.from_url(REDIS_URL).pttl("ratelimit:cooldown:gemini") < 0          # 503 sets no cooldown
+    row = wait_for_status(db, job_id, TERMINAL, timeout=60)
+    assert (row["status"], row["attempts"]) == ("COMPLETED", 1)
+
+
+def test_persistent_gemini_503_dead_letters_with_the_provider_status(api, db, procs, fx):
+    from tests.support.rabbit import peek_messages, queue_state
+    job_id = submit_ok(api)
+    procs.start("publisher", "notesagent.outbox")
+    start(procs, fx, FAKE_GEMINI="unavailable_always", MAX_ATTEMPTS=3, FAKE_YT_WITH_FIXTURES="1")
+    row = wait_for_status(db, job_id, TERMINAL, timeout=90)
+    assert row["status"] == "DEAD_LETTERED" and row["attempts"] == 3 and row["retry"] is None
+    assert row["error"] == {"code": "RETRIES_EXHAUSTED", "message": row["error"]["message"], "attempts": 3,
+                            "last_error_code": "GEMINI_HTTP_503", "last_http_status": 503,
+                            "last_provider_code": "UNAVAILABLE"}
+    assert [d["delay_sec"] for d in retry_events(db, job_id)] == [3, 6]                   # Gemini schedule
+    [dead] = [e["detail"] for e in events(db, job_id) if e["event_type"] == "dead_lettered"]
+    assert (dead["last_http_status"], dead["last_provider_code"]) == (503, "UNAVAILABLE")
+    assert len(gemini_calls(fx)) == 3 and summary_cp(db, job_id) == []
+    wait_until(lambda: queue_state("jobs.dlq").messages == 1, timeout=20, what="DLQ copy")
+    [copy] = peek_messages("jobs.dlq")
+    assert json.loads(copy.body)["last_error_code"] == "GEMINI_HTTP_503"
+    body = api.get(f"/jobs/{job_id}").json()
+    assert body["error"]["last_provider_code"] == "UNAVAILABLE"
+    assert "SECRET-LIKE-UPSTREAM-TEXT" not in json.dumps(body) + procs.all_logs()
+
+
 def test_malformed_output_is_retried_then_dead_lettered(api, db, procs, fx):
     job_id = submit_ok(api)
     procs.start("publisher", "notesagent.outbox")
