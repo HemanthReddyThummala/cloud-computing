@@ -4,8 +4,33 @@
   "version": "0.1.0",
   "description": "Turn YouTube videos into structured study notes with real frames, published to Notion.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAj2/Dvr7890CnV+pJRTS7+nNjT+uYRcvlMFdnhhRuObvVLwh59j95lwCoYeNru3P8Z/33P5V1wCLZSmKRPP7DXvwiHDrlqN3RFQxx9Muqgkf8G5xcZdx/VsvAkHQE8MV+vxQ8tfAZJm0Z9XC9V+/RQsog3BP+Da/UIRMSceRIzSTl29qjkRARMCiLcPS54E7yKldu7Yo7xR3mSxK7VmzDMbHGdnYuZgJrEmWtd60LhXhwh+MSfelWyb8R/NfiGpI1JlK65Efa82deyJ23L7I2k73ciA7/BxwUID+hIUUZ3gsCuuh4UcugkZZ8Uql0REZsKGdYHQRLgnAZ7sPU94VoVQIDAQAB",
-  "permissions": ["identity"],
+  "permissions": [
+    "identity",
+    "storage"
+  ],
   "background": {
-    "service_worker": "background.js"
-  }
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "host_permissions": [
+    "http://localhost:8000/*"
+  ],
+  "action": {
+    "default_title": "Video Notes Agent",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
 }

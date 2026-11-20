@@ -26,7 +26,7 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from notesagent.common import jobs_repo
 from notesagent.common.broker import BrokerClient
 from notesagent.common.config import Settings
-from notesagent.common.crypto import CredentialCipher
+from notesagent.common.crypto import CredentialCipher, CredentialError, TokenSealer
 from notesagent.common.errors import ApiError
 from notesagent.gateway.validation import SubmitJobRequest
 
@@ -48,13 +48,26 @@ class _KeyTakenConcurrently(Exception):
 
 class JobSubmissionService:
     def __init__(self, pool: AsyncConnectionPool, broker: BrokerClient, cipher: CredentialCipher,
-                 settings: Settings) -> None:
+                 settings: Settings, sealer: TokenSealer | None = None) -> None:
         self._pool = pool
         self._broker = broker
         self._cipher = cipher
         self._settings = settings
+        self._sealer = sealer
+
+    def _mailbox_token(self, notion_token: str) -> str:
+        """ADR-18: a sealed token (from /oauth/notion/callback) is unsealed here, so only the real access
+        token ever reaches the per-job mailbox. Raw tokens (spec example) are passed through."""
+        if self._sealer is None or not TokenSealer.is_sealed(notion_token):
+            return notion_token
+        try:
+            return self._sealer.unseal(notion_token)
+        except CredentialError:
+            raise ApiError(400, "INVALID_NOTION_TOKEN",
+                           "notion_token is not a valid token issued by this gateway; connect Notion again.") from None
 
     async def submit(self, req: SubmitJobRequest, idempotency_key: str | None) -> SubmitOutcome:
+        mailbox_token = self._mailbox_token(req.notion_token)
         fingerprint: str | None = None
         if idempotency_key:
             fingerprint = self._cipher.fingerprint({
@@ -71,7 +84,7 @@ class JobSubmissionService:
 
         # Step 2: credential mailbox (broker), confirmed before anything is committed.
         try:
-            await self._broker.put_credential(job_id, self._cipher.seal(job_id, req.notion_token))
+            await self._broker.put_credential(job_id, self._cipher.seal(job_id, mailbox_token))
         except Exception as exc:  # noqa: BLE001
             log.warning("credential mailbox publish failed", extra={"job_id": str(job_id),
                                                                     "error_type": type(exc).__name__})

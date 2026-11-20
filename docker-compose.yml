@@ -112,6 +112,14 @@ services:
       BACKOFF_SCHEDULE_SEC: ${BACKOFF_SCHEDULE_SEC:-10,30,90}
       LOCK_RETRY_DELAY_SEC: ${LOCK_RETRY_DELAY_SEC:-5}
       INFRA_RETRY_DELAY_SEC: ${INFRA_RETRY_DELAY_SEC:-30}
+      # Notion OAuth (ADR-18): code exchange happens ONLY here; the client secret never reaches the
+      # extension or the workers. Values come from .env and are never logged.
+      NOTION_CLIENT_ID: ${NOTION_CLIENT_ID:-}
+      NOTION_CLIENT_SECRET: ${NOTION_CLIENT_SECRET:-}
+      NOTION_REDIRECT_URI: ${NOTION_REDIRECT_URI:-}
+      NOTION_VERSION: ${NOTION_VERSION:-2026-03-11}
+      NOTION_RPS_LIMIT: ${NOTION_RPS_LIMIT:-2.5}
+      OAUTH_STATE_TTL_SEC: ${OAUTH_STATE_TTL_SEC:-600}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=3)"]

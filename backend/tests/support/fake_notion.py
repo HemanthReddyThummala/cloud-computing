@@ -187,5 +187,36 @@ async def send_upload(upload_id: str, request: Request):
     return {"object": "file_upload", "id": upload_id, "status": "uploaded"}
 
 
+@app.post("/v1/oauth/token")
+async def oauth_token(request: Request):
+    """Fake OAuth token endpoint (ADR-18 tests). Client credentials expected from env
+    FAKE_NOTION_CLIENT_ID / FAKE_NOTION_CLIENT_SECRET (HTTP Basic). Behaviour by code:
+    good-* -> 200 · expired -> 400 invalid_grant · boom500 -> 500 · ratelimit -> 429 (Retry-After 7)."""
+    import base64
+    body = await request.json()
+    expected = base64.b64encode(f"{os.environ.get('FAKE_NOTION_CLIENT_ID', '')}:"
+                                f"{os.environ.get('FAKE_NOTION_CLIENT_SECRET', '')}".encode()).decode()
+    basic_ok = request.headers.get("authorization", "") == f"Basic {expected}"
+    STATE.setdefault("oauth", []).append({"basic_ok": basic_ok, "grant_type": body.get("grant_type"),
+                                          "code": body.get("code"), "redirect_uri": body.get("redirect_uri")})
+    code = str(body.get("code") or "")
+    if not basic_ok:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+    if code == "ratelimit":
+        return _err(429, "rate_limited", "Rate limited", headers={"Retry-After": "7"})
+    if code == "boom500":
+        return _err(500, "internal_server_error", "boom")
+    if not code.startswith("good-") or body.get("grant_type") != "authorization_code":
+        return JSONResponse({"error": "invalid_grant", "error_description": "Invalid code."}, status_code=400)
+    return {"access_token": f"ntn_fake_access_{code}", "token_type": "bearer", "refresh_token": f"nrt_fake_{code}",
+            "bot_id": "bot-123", "workspace_id": "ws-456", "workspace_name": "Test Workspace",
+            "owner": {"type": "user", "user": {"object": "user", "id": "user-789"}}}
+
+
+@app.get("/_oauth")
+async def oauth_log():
+    return STATE.get("oauth", [])
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")

@@ -87,6 +87,9 @@ Redis 7: worker heartbeats / health (planned: global rate-limit buckets)
 | Part 3 | Classified retries via the outbox (ADR-11): `MAX_ATTEMPTS` = total executions (5), backoff 10/30/90 s with the last step repeating, Retry-After honoured, uncounted delay hops, new event id per retry (message identity gates stale copies), DEAD_LETTERED with `RETRIES_EXHAUSTED` + DLQ copy, `retry` view in the API, delay-without-counting when PostgreSQL is unavailable | [TEST] 15 integration (incl. 5 SIGKILL crash windows) + 13 unit; crash set 10 consecutive runs 160/160 |
 | Phase A Part 1 (= Phase 2 Part 4) | Broker dead-letter auditing (ADR-12): `jobs.dlq.audit` + parking queue (at-least-once), auditor in every worker, origin marker `x-event-type` on every published message, migration 004 (outcomes `stale`, `inconsistent`), audit-limit validation for the carried-over delivery count | [TEST] 43 unit + 17 integration + 12 migration + 1 topology; based on two isolated RabbitMQ probes |
 | Deployment | Dev stack moved to Phase 2; migrations 003/004 applied; legacy `jobs.work` removed | [RUN] 2026-11-19, see §4 |
+| **Phase C Part 3** | **Take Notes button, submission, polling, progress popup** (ADR-20): content script on `https://www.youtube.com/*` (one button in the player toolbar on `/watch` pages; SPA navigation via `yt-navigate-finish` + `popstate` + 1 s watchdog; per-video state); background `lib/jobs.js` (Notion-connected check, duplicate prevention for active jobs and concurrent clicks, `Idempotency-Key` reused after uncertain failures; one sequential polling loop over `GET /jobs/{id}`: 3 s, 10 s while retrying, backoff ≤ 30 s on errors, stops at terminal states; jobs persisted in `chrome.storage.local` and resumed on every worker start); popup stage sequence, warnings, failures, "View in Notion" (validated Notion URL). No new permissions, no backend change | [TEST] `npm test`: **89 passed** (50 new; 5 consecutive runs 89/89); real gateway + fake Notion cross-check **10/10 PASS** (incl. idempotent replay and real `GET /jobs/{id}` parsing), 0 secrets in logs. Content script tested with a fake DOM (jsdom install was not permitted); not yet checked on real YouTube; no real job submitted; not deployed |
+| **Phase C Part 2** | **Extension Notion sign-in** (ADR-19, `extension/`): MV3 module service worker (`lib/auth.js`, `lib/gateway.js`) runs authorize → `launchWebAuthFlow` → callback, checks the redirect URI and state locally, stores only the sealed token + workspace metadata in `chrome.storage.local`; popup with Connect/Disconnect and readable errors; `job:submit` message sends the sealed token to `POST /jobs` (`INVALID_NOTION_TOKEN` → reconnect). Manifest: `identity`, `storage`, host `http://localhost:8000/*`; no CORS | [TEST] `npm test` in `extension/`: **39 passed** (fake chrome + local fake gateway, real fetch); cross-check of the extension code against the **real gateway** + fake Notion token endpoint in a throwaway test container: **8/8 PASS**, 0 secrets in logs. Not loaded in Chrome by me; **no real Notion sign-in**; not deployed |
+| **Phase C Part 1** | **Notion OAuth in the gateway** (ADR-18, `gateway/oauth.py`): `POST /oauth/notion/authorize` (Notion URL + single-use state; only its SHA-256 in Redis, `SET NX EX` 600 s) and `POST /oauth/notion/callback` (the extension forwards `code`/`state` from the `chromiumapp.org` redirect; state consumed with `GETDEL`; server-side exchange at `/v1/oauth/token` with HTTP Basic client ID/secret + the exact registered redirect URI, a Notion limiter permit, 15 s timeout). Returns only a **sealed token** (`nva1.` Fernet, HKDF key from `JOB_PAYLOAD_ENCRYPTION_KEY`); `POST /jobs` unseals it into the credential mailbox. Denied / missing / invalid state / 4xx / 401 / 429 / 5xx / network each mapped to a fixed error code; no token, code or secret in responses or logs. No refresh (not documented as required). Also: `NOTION_DEFAULT_PARENT_ID` accepts a page URL; `notion.com` result URLs accepted | [TEST] unit + integration against a fake Notion token endpoint (never the real API); full suite **861 passed** (2026-11-20 23:02); real settings check (booleans only): gateway OAuth configured, redirect URI = extension URI. **No real Notion authorization performed. Not deployed** |
 | **Phase B Part 4** | **PUBLISHING stage** (ADR-17, `worker/publish.py`, `worker/notion.py`): `httpx` Notion client (Bearer token from the credential mailbox, `Notion-Version` 2026-03-11, no own retries, a `Provider.NOTION` permit before every request, method-aware error classification). Deterministic page plan: marker (job id) first, summary, key points, timestamped sections with video links, key frames uploaded via the File Upload API with LLM captions (time + caption + reason), text-only when no frames. Destination: job `notion_parent_id` or `NOTION_DEFAULT_PARENT_ID` (else FAILED `NOTION_PARENT_MISSING` before any request). **No duplicate pages:** every attempt reconciles first (child page with the same title whose first block carries the job marker) and writes only the missing suffix of the plan; covers redelivery, 429 retries and uncertain 5xx writes. Result `{notion_page_url, frames_requested, frames_published}`, with frames_published counted from Notion; permanent upload failure → note + `FRAME_UPLOAD_FAILED` warning | [TEST] 19 unit (in-process fake Notion) + 9 integration (real worker + fake Notion server process, including SIGKILL mid-append and after all writes); full suite **825 passed** (2026-11-20 22:37). **No real Notion verification** (no OAuth token exists yet). **Not deployed** |
 | **Phase B Part 3** | **EXTRACTING_FRAMES stage** (ADR-16, `worker/frames.py`, `YouTubeClient.download_video`): one `Provider.YOUTUBE` permit + one `yt-dlp` download of a video-only stream (≤ 720p, H.264 preferred, no internal retries, size guard) into a private temp dir → per Gemini timestamp an exact FFmpeg frame (JPEG ≤ 1280 px, never upscaled), validated with `ffprobe` (decodable MJPEG, non-empty, ≤ 5 MiB). Timestamps checked against the real duration. **Only FFmpeg-decoded source frames are stored** (base64 in the checkpoint, sha256), each with its timestamp, Gemini caption/reason and `caption_basis=transcript`. **Graceful degradation:** failed timestamps → warnings `FRAME_EXTRACTION_FAILED` (spec shape) → COMPLETED_WITH_WARNINGS; source not obtainable for non-retryable reasons → text-only. 429 / network / 5xx → existing retries; unavailable → FAILED (ADR-14). Temp dirs removed in every case; leftovers of dead/zombie workers purged. **Docker:** Debian `ffmpeg` 7.1.5 in the base image (≈ 430 MB); **no JS runtime** (verified not needed today) | [TEST] 42 unit (real FFmpeg on synthetic videos) + 7 integration (real worker); full suite **797 passed** (2026-11-20 21:19). [RUN] real `yt-dlp` + FFmpeg on one public video outside the suite: 1 permit, 2 real frames, 1 out-of-range warning, temp dir empty. **Not deployed** (dev image rebuilt, 961 MB) |
 | **Phase B Part 2** | **SUMMARIZING stage** (ADR-15, `worker/summarize.py`, `worker/gemini.py`): Gemini `gemini-3.8-flash` (official `google-genai==3.6.1`, SDK retries off, JSON-schema output, thinking `low`) over the TRANSCRIBING checkpoint → validated checkpoint with `summary`, `key_points`, ordered `sections` (`start_sec`), `important_timestamps` (`timestamp_sec`, `caption`, `reason`, `transcript_excerpt`; ≤ `MAX_FRAMES` 8, de-duplicated). **Grounding:** Gemini answers with global transcript segment numbers; the timestamps are those segments' real starts (invented numbers dropped). **Chunking:** in order by `TRANSCRIPT_CHUNK_TOKENS` (12,000, capped by TPM), + 1 merge request when chunked. A Gemini permit before every request + `settle()`. Errors → existing retries (429/RetryInfo + shared cooldown, daily quota → Pacific reset, 5xx/network transient, invalid output bounded → DEAD_LETTERED; 4xx/blocked/missing key → FAILED) | [TEST] 33 unit + 11 integration (real worker, fake Gemini raising real SDK errors); full suite **748 passed** (2026-11-20 20:11). [RUN] config: key loaded and masked (hash-compared, never printed); **one real Gemini request** via the production stage on the stored 'Me at the zoo' transcript: OK, 32.7 s, 417/243 tokens, 1 grounded timestamp. **Not deployed** (dev image rebuilt, containers not recreated) |
@@ -141,7 +144,7 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
 | Requirement | Status |
 |---|---|
 | R1 gateway / broker / ≥ 2 workers | **Done** [TEST][RUN] |
-| R1/R2 browser extension (content script, background, OAuth, popup) | **NOT IMPLEMENTED** — `extension/` contains only `manifest.json` (name, version, key) |
+| R1/R2 browser extension (content script, background, OAuth, popup) | **Implemented** (Phase C Parts 2–3, ADR-19/20) [TEST]: content-script button with SPA navigation, OAuth + token storage, submission, status polling, progress popup with View in Notion / warnings / failures. **Not yet verified in real Chrome on YouTube**; no real sign-in or job yet |
 | R3 transcript + duration | **Done** (Phase B Part 1, ADR-14) [TEST]; deployed and verified with a real job on the dev stack [RUN] |
 | R3 LLM synthesis (bullets, timestamps, captions, chunking) | **Done** (Phase B Part 2, ADR-15) [TEST]; one real Gemini request verified [RUN]; not yet deployed |
 | R3 frame extraction | **Done** (Phase B Part 3, ADR-16) [TEST]; one real video verified outside the suite [RUN]; not yet deployed |
@@ -251,6 +254,9 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
 | 16 | EXTRACTING_FRAMES: one yt-dlp video-only download (permit) + exact FFmpeg frames validated by ffprobe; only real source frames stored (base64 + sha256) with transcript-based captions; failed timestamps → warnings, unobtainable source → text-only; FFmpeg in the image, no JS runtime |
 | 15 | SUMMARIZING: Gemini via `google-genai` (SDK retries off), numbered transcript lines → segment numbers → real segment start times (grounded); pydantic-validated notes; ordered token-budget chunking + merge request; permit + settle per request; classified errors into the existing retries; no partial-chunk persistence |
 | 14 | TRANSCRIBING: yt-dlp metadata (true duration, constraint A before any transcript request) + youtube-transcript-api; limiter permit per request; library errors → ADR-10 classes; **D-1 settled: unavailable/private/deleted → FAILED** (DLQ demo uses retryable failures); yt-dlp JS-runtime deprecation noted |
+| 20 | Extension Take Notes: content script button synced with YouTube SPA navigation; background submission with duplicate prevention + Idempotency-Key reuse after uncertain failures; one sequential polling loop on `GET /jobs/{id}` with backoff, persisted jobs resumed on every worker start (no `alarms`); popup stage sequence, warnings, failures, validated "View in Notion" link |
+| 19 | Extension sign-in in the background service worker only; local redirect-URI + state checks; sealed token in `chrome.storage.local`, last error in `storage.session`; permissions `identity`, `storage`, host `http://localhost:8000/*`; no CORS |
+| 18 | Notion OAuth: Mode A redirect to the extension, which forwards code + state; gateway-only exchange with the client secret; single-use hashed state in Redis; sealed token returned to the extension and unsealed into the mailbox on `POST /jobs`; no refresh; fixed error codes |
 | 13 | Shared external-API rate limiter: atomic Redis Lua on Redis time. Gemini RPM/input-TPM sliding windows + RPD per Pacific day (values used as given, already × 0.8); Notion spacing per connection; YouTube cooldown only. Shared Retry-After cooldown reported by the worker; waits ≤ `RATE_LIMIT_MAX_WAIT_SEC`, else the existing outbox retry; Redis down → `RateLimiterUnavailable` |
 
 ---
@@ -262,7 +268,7 @@ Each part has detailed session logs in `docs/session_logs/` (11 files).
 | YouTube transcript + duration | `youtube-transcript-api==1.2.5` (no key; unofficial web-client interface) + `yt-dlp==2026.10.26` metadata — ADR-14; settings `MAX_VIDEO_DURATION_SEC` (1200), `TRANSCRIPT_LANGUAGES` (en), `YOUTUBE_REQUEST_TIMEOUT_SEC` (30) | none | **Implemented** (Phase B Part 1); not deployed |
 | Frames | `yt-dlp` video-only download (≤ 720p) + `ffmpeg -ss T -frames:v 1` (ADR-16); settings `FRAME_SOURCE_MAX_HEIGHT` (720), `FRAME_MAX_WIDTH` (1280) | none | **Implemented** (Phase B Part 3); FFmpeg 7.1.5 in the image; not deployed |
 | Gemini | `gemini-3.8-flash`, thinking level `low`, free tier | `GEMINI_API_KEY` (from Google AI Studio, project **without billing**) | **Set by the user in `.env`; loaded and verified** (hash-compared, masked; one real request OK on 2026-11-20). Limits per ADR-13: 4 RPM / 200k TPM / 16 RPD. SUMMARIZING implemented (ADR-15) |
-| Notion | REST API (httpx), File Upload API, OAuth | `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `NOTION_REDIRECT_URI`, `NOTION_DEFAULT_PARENT_ID` | all **empty** in `.env`; integration not yet created |
+| Notion | REST API (httpx), File Upload API, OAuth (ADR-18) | `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `NOTION_REDIRECT_URI` (gateway only), `NOTION_DEFAULT_PARENT_ID` (worker) | **Set by the user in `.env`** (2026-11-20); presence verified without printing values; redirect URI = `https://kkkeigfecmfhmainhbkcpdhjnloifbdf.chromiumapp.org/notion`; default parent is a page URL (parsed). No real authorization yet |
 
 **Documented external limits** (read 2026-11-19, see `docs/session_logs/external_services_credentials_inspection.md`):
 - **Gemini:** RPM / TPM / RPD **per project** (not per key); the RPD reset is at midnight Pacific.
@@ -300,7 +306,8 @@ All tests run in Docker against real PostgreSQL/RabbitMQ/Redis using isolated te
 
 | Run | Date / time (host clock) | Result |
 |---|---|---|
-| **Full suite (latest)** | 2026-11-20 22:25–22:37 | **825 passed**, 0 failed, 0 errors (717.59 s), incl. 19 unit (`test_unit_publish.py`) + 9 integration (`test_publish_stage.py`) publishing tests |
+| **Full suite (latest, after Phase C Part 1)** | 2026-11-20 22:50–23:02 | **861 passed**, 0 failed, 0 errors (741.57 s), incl. the new `test_unit_oauth.py` + `test_oauth.py` cases (36 new) |
+| Full suite (after Phase B Part 4) | 2026-11-20 22:25–22:37 | 825 passed, 0 failed, 0 errors (717.59 s), incl. 19 unit (`test_unit_publish.py`) + 9 integration (`test_publish_stage.py`) publishing tests |
 | Full suite (after Phase B Part 3) | 2026-11-20 21:08–21:19 | 797 passed, 0 failed, 0 errors (657.90 s), incl. 42 unit (`test_unit_frames.py`, real FFmpeg) + 7 integration (`test_frames_stage.py`) frame tests |
 | Full suite (after Phase B Part 2) | 2026-11-20 20:00–20:11 | 748 passed, 0 failed, 0 errors (640.58 s), incl. 33 unit (`test_unit_summarize.py`) + 11 integration (`test_summarize_stage.py`) summarization tests. (An earlier run that day had 4 failures in `test_ratelimit.py` from a config validator added in Phase B Part 2; fixed, see that session log) |
 | Full suite (after Phase B Part 1) | 2026-11-20 01:49–02:00 | 704 passed, 0 failed, 0 errors (627.78 s), incl. 40 unit (`test_unit_transcribe.py`) + 11 integration (`test_transcribe_stage.py`) transcript tests |
@@ -334,8 +341,8 @@ extension. All stage behaviour is exercised with fixture stages.
 
   **Settled 2026-11-20 by the user's Phase B Part 1 instruction: FAILED** (option b; ADR-14). The DLQ
   demo must use a retryable failure (e.g. persistent network/5xx errors with the demo profile).
-- **Notion redirect URI:** the `chromiumapp.org` form is not documented by Notion; it needs a real test
-  (approval required).
+- **Notion redirect URI:** the `chromiumapp.org` URI is registered and configured (ADR-18), but no real
+  authorization has run yet (approval required, Phase C Part 2).
 - **Transcript method:** no ADR yet.
 
 ### Limitations and risks (no known failing test)
@@ -367,6 +374,35 @@ extension. All stage behaviour is exercised with fixture stages.
 ---
 
 ## 11. Recommended next task
+
+**Update after Phase C Part 3 (Take Notes, polling, progress popup, ADR-20):** the extension is
+functionally complete for the spec's §2. Next:
+1. **With the user's approval:** deploy the current image (gateway with OAuth + all four stages; the dev
+   stack still runs the Phase B Part 1 image). Then load the extension, do the first real Notion
+   sign-in, and run the first real end-to-end job on a short public video. Check: button placement on
+   real YouTube, the stage sequence in the popup, the Notion page (summary, timestamps, frames with
+   captions), and the View in Notion link.
+2. **Phase D:** the README (base URL, default Notion destination, every required env var, how to load
+   the extension), and demos of the §6 failure modes, worker scaling and crash recovery, and burst
+   submission without an LLM 429.
+
+**Earlier update after Phase C Part 2 (extension sign-in, ADR-19):** the extension side of the sign-in is
+built and tested (39 Node tests + 8/8 cross-check against the real gateway with a fake Notion). Next:
+1. **With the user's approval:** deploy the current image (gateway with OAuth, all four stages), load
+   the unpacked extension, and do the **first real Notion sign-in**.
+2. **Phase C Part 3:** the content-script "Take Notes" button (SPA navigation) → `job:submit`; status
+   polling in the background; the progress popup (Queued → … → Done, "View in Notion", warnings and
+   failures). Then the first real end-to-end job.
+
+**Earlier update after Phase C Part 1 (gateway Notion OAuth, ADR-18):** implemented and tested against a fake
+Notion token endpoint; not deployed; no real authorization. The next task is **Phase C Part 2**:
+- the extension's `launchWebAuthFlow`: call `/oauth/notion/authorize`, forward `code`/`state` (or `error`)
+  from the redirect URL to `/oauth/notion/callback`, and store the sealed token in `chrome.storage.local`;
+- `host_permissions` for the gateway origin (CORS is not wired; it is not needed from the service worker);
+- then, with the user's approval, deploy the current image and run the first real authorization and the
+  first real end-to-end publish.
+
+The text below predates Phase C.
 
 **Phase B Part 4 (PUBLISHING) is implemented** — see §3 and ADR-17. Evidence: 28 new tests and the full
 suite of 825 passed, all against a fake Notion API. **The whole backend pipeline now exists**

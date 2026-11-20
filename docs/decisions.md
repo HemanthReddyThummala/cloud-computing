@@ -518,3 +518,136 @@ why, and what it does **not** guarantee.
     (more blocks than planned → FAILED `NOTION_PAGE_CONFLICT`);
   - a database as parent is not supported;
   - not yet verified against the real Notion API (no OAuth token yet).
+
+## ADR-18 Notion OAuth in the gateway: extension redirect + server-side exchange + sealed token (Phase C, Part 1)
+
+- **Redirect (ADR-07 Mode A, as registered in the Notion integration):** `NOTION_REDIRECT_URI` =
+  `https://kkkeigfecmfhmainhbkcpdhjnloifbdf.chromiumapp.org/notion`. Notion redirects the browser to the
+  extension (Chrome's `launchWebAuthFlow` intercepts `chromiumapp.org`); the gateway is never the
+  browser redirect target. The extension forwards `code` + `state` to the gateway, and the gateway uses
+  exactly `NOTION_REDIRECT_URI` in the token request.
+- **Endpoints** (`gateway/oauth.py`; responses `Cache-Control: no-store`):
+  - `POST /oauth/notion/authorize` → `{authorization_url, state, redirect_uri, expires_in}`. The state
+    is `secrets.token_urlsafe(32)`; Redis stores only its SHA-256 (`SET NX EX OAUTH_STATE_TTL_SEC`,
+    default 600 s).
+  - `POST /oauth/notion/callback` with `{state, code}` or `{state, error}`:
+    1. The state is consumed with `GETDEL` (single use, also on errors).
+    2. `error=access_denied` → 400 `OAUTH_ACCESS_DENIED`.
+    3. Otherwise the code is exchanged at `{NOTION_API_BASE_URL}/oauth/token` (HTTP Basic
+       `NOTION_CLIENT_ID:NOTION_CLIENT_SECRET`, JSON `grant_type=authorization_code, code,
+       redirect_uri`, `Notion-Version`, 15 s timeout, after a `Provider.NOTION` limiter permit).
+    4. Success → `{notion_token: "nva1.…", token_format: "sealed-v1", workspace_id, workspace_name,
+       bot_id}`.
+  - Errors:
+    - 400: `OAUTH_INVALID_REQUEST`, `OAUTH_STATE_INVALID` (unknown / expired / used), `OAUTH_CODE_MISSING`,
+      `OAUTH_AUTHORIZATION_FAILED`, `OAUTH_EXCHANGE_FAILED` (Notion 4xx, e.g. invalid_grant);
+    - 502: `OAUTH_CLIENT_REJECTED` (Notion 401/403 = wrong client credentials), `NOTION_UNAVAILABLE`
+      (5xx), `NOTION_UNREACHABLE` (network);
+    - 503: `NOTION_RATE_LIMITED` (+ Retry-After), `OAUTH_NOT_CONFIGURED`,
+      `OAUTH_STATE_STORE_UNAVAILABLE` (Redis).
+- **Sealed token (spec §2/§5 vs. no raw tokens in responses):**
+  - The spec has the extension store the token and send it with every job, so the gateway never stores
+    it. The gateway therefore returns the access token only **sealed**: Fernet with a key derived by
+    HKDF-SHA256 from `JOB_PAYLOAD_ENCRYPTION_KEY`, purpose label `notesagent/notion-oauth-token/v1`,
+    prefix `nva1.` (`TokenSealer`).
+  - The extension stores the sealed value and sends it as `notion_token`. `POST /jobs` unseals it
+    (invalid/tampered → 400 `INVALID_NOTION_TOKEN`) and only the real token enters the per-job mailbox
+    (ADR-03).
+  - The gateway stores no token; mailbox blobs and sealed tokens use separate keys and cannot be
+    swapped.
+  - Raw tokens are still accepted (spec example `secret_…`, tests).
+  - Rotating `JOB_PAYLOAD_ENCRYPTION_KEY` invalidates sealed tokens (the user reconnects Notion).
+- **Not implemented, deliberately:** token refresh. Notion's authorization docs describe a refresh
+  token but do not state that access tokens expire; the refresh token is not kept. If tokens turn out
+  to expire, jobs fail with `NOTION_UNAUTHORIZED` and the user reconnects. There is no PKCE (not
+  documented by Notion).
+- **Secrets:** the client secret is passed only to the gateway service (Compose), held as `SecretStr`
+  and sent only in the Basic header. Codes, tokens and the client secret are never logged or returned;
+  Notion error bodies are never echoed.
+- **Related fixes:**
+  - `NOTION_DEFAULT_PARENT_ID` may be a Notion page URL; its trailing 32-hex ID is extracted.
+  - Result URLs on `notion.com` are accepted besides notion.so / notion.site.
+
+## ADR-19 Extension Notion sign-in: background-only, sealed token in chrome.storage.local, no CORS (Phase C, Part 2)
+
+- **Where:** only the MV3 background service worker (ES module, `extension/lib/auth.js`) talks to the
+  gateway and reads the stored token. The popup and the later content script send runtime messages
+  (`auth:status`, `auth:signIn`, `auth:signOut`, `job:submit`). Messages from other senders are ignored,
+  and responses never contain the token.
+- **Flow:**
+  1. `POST /oauth/notion/authorize`.
+  2. Check that the gateway's `redirect_uri` equals `chrome.identity.getRedirectURL("notion")`
+     (else `REDIRECT_MISMATCH`, no window) and that `authorization_url` is https.
+  3. `launchWebAuthFlow({interactive: true})`.
+  4. Check that the returned URL is our redirect URI and that its `state` equals the issued state. A
+     foreign state is never forwarded (`STATE_MISMATCH`).
+  5. `POST /oauth/notion/callback` with `{state, code}` or `{state, error}`.
+  6. Store only a value that starts with `nva1.` and has `token_format` `sealed-v1`.
+- **Storage:**
+  - `chrome.storage.local` `notionAuth` = `{sealedToken, tokenFormat, workspaceId, workspaceName, botId,
+    connectedAt}`;
+  - `chrome.storage.session` `notionAuthError` = `{code, message}`.
+  - The authorization code and state are never stored or logged; logs carry outcome codes only.
+- **Behaviour:**
+  - Concurrent sign-ins share one attempt.
+  - A failed re-sign-in keeps the existing connection.
+  - Sign-out bumps a generation counter, so an attempt finishing afterwards is discarded.
+  - `POST /jobs` answering `INVALID_NOTION_TOKEN` (for example after a key rotation) clears the
+    connection → `NOTION_RECONNECT_REQUIRED`.
+  - Sign-out is local only; the integration is revoked in Notion's settings.
+- **Permissions:** `identity` (launchWebAuthFlow, getRedirectURL), `storage`, and the host permission
+  `http://localhost:8000/*` (the gateway). Nothing else.
+- **No CORS:** extension service workers with a matching host permission make cross-origin requests
+  without CORS, and no other extension context calls the gateway. `ALLOWED_EXTENSION_ORIGIN` therefore
+  stays unused.
+- **Not refreshed:** see ADR-18.
+- **Known limit:** the popup closes when the Notion window opens, so the result appears when the popup
+  is reopened. If Chrome stops the service worker during a very long sign-in, the attempt is lost and
+  the user clicks Connect again; the unused state expires in the gateway.
+
+## ADR-20 Extension: Take Notes button, submission, polling and progress popup (Phase C, Part 3)
+
+- **Content script** (`extension/content.js`, classic script on `https://www.youtube.com/*`, plus
+  `content.css`):
+  - One button `#vna-take-notes`, prepended to `#movie_player .ytp-right-controls`, only on `/watch`
+    pages with an 11-character `v`.
+  - It is kept in sync with YouTube's SPA navigation by `yt-navigate-finish`, `popstate`, and a 1 s
+    watchdog. The watchdog also catches a late or rebuilt player and missed events.
+  - It is moved, never duplicated, and removed off watch pages.
+  - Per-video button state lives in the tab (Submitting… / Notes requested ✓ / Notes in progress /
+    retry), so a second click on the same video sends nothing.
+  - It sends only `{type: "job:submit", youtubeUrl: "https://www.youtube.com/watch?v=<id>"}` and never
+    sees a token.
+- **Submission** (`extension/lib/jobs.js`, background):
+  - Rejects anything that is not a youtube.com watch URL (`NOT_A_VIDEO`) and requires a Notion
+    connection (`NOT_SIGNED_IN`), both before any request.
+  - Prevents duplicates in three ways: an active tracked job for the same video is returned
+    (`alreadyTracking`); concurrent clicks share one request; every submission sends an
+    `Idempotency-Key` `vna:<videoId>:<uuid>`.
+  - When the outcome is unknown (network error, timeout, invalid response, `IDEMPOTENCY_CONFLICT`),
+    the key is kept for 1 h, so the next click replays rather than duplicates (gateway TTL 24 h).
+  - Definite errors drop the key. `IDEMPOTENCY_KEY_REUSED` (the sealed token changed after a
+    reconnect) retries once with a new key.
+  - The token is read only by `auth.submitJob`, unchanged apart from passing the key header.
+- **Polling:**
+  - Uses `GET /jobs/{id}` (it already carries `result`, `warnings`, `error`, `retry`); no new endpoint.
+  - One timer loop for all jobs, with requests sequential (at most one in flight).
+  - Every 3 s while running; 10 s while `retry` is set; on errors, exponential backoff capped at 30 s,
+    without giving up.
+  - Stops on COMPLETED, COMPLETED_WITH_WARNINGS, FAILED, DEAD_LETTERED, or 404 (`NOT_FOUND`, local).
+- **Restart recovery without new permissions:** tracked jobs live in `chrome.storage.local["jobs"]`
+  (display data only: ids, status, progress, title, warnings, error, result URL, poll bookkeeping; at
+  most 10, oldest finished dropped first). Every service-worker start (popup opened, Take Notes
+  clicked, browser start) runs `resume()`. Each poll writes storage, which keeps the worker alive while
+  jobs run. No `alarms` permission.
+- **Popup:**
+  - Shows the stages Queued → Transcribing → Summarizing → Extracting Frames → Publishing → Done, with
+    done / current / failed marks and progress %.
+  - A waiting retry is shown as still processing.
+  - **FAILED** and **DEAD_LETTERED** are shown in red with the failed stage and a readable cause.
+  - **COMPLETED_WITH_WARNINGS** shows the frame count and each warning.
+  - "View in Notion" uses the gateway's `notion_page_url` and is shown only if it is https on
+    notion.so / notion.site / notion.com.
+  - The popup reads `jobs` from storage and re-renders on `storage.onChanged`. No `innerHTML`.
+- **Permissions unchanged** (`identity`, `storage`, host `http://localhost:8000/*`). The content script
+  is declared for `https://www.youtube.com/*` only.

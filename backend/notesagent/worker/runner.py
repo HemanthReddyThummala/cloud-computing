@@ -74,7 +74,7 @@ def advisory_lock_key(job_id: uuid.UUID) -> int:
     return int.from_bytes(job_id.bytes[:8], "big", signed=True)
 
 
-_NOTION_HOSTS = ("notion.so", "notion.site")
+_NOTION_HOSTS = ("notion.so", "notion.site", "notion.com")   # notion.com: Notion's current domain (ADR-18)
 
 
 def validate_publish_result(result: Any) -> dict[str, Any]:

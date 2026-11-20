@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Video Notes Agent</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <h1>Video Notes Agent</h1>
+  <section id="notion" class="card" data-tone="idle" aria-live="polite">
+    <p id="notion-text">Checking Notion connection…</p>
+    <p id="notion-detail" class="detail" hidden></p>
+    <button id="notion-button" type="button" hidden></button>
+  </section>
+  <h2>Notes</h2>
+  <p id="jobs-empty" class="detail">No notes yet. Open a YouTube video and click <strong>Take Notes</strong> in the player.</p>
+  <ol id="jobs" class="jobs" aria-live="polite"></ol>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

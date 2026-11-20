@@ -6,6 +6,7 @@ logging a ``Settings`` object never reveals passwords or keys.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import uuid
 
@@ -110,15 +111,49 @@ class Settings(BaseSettings):
     notion_request_timeout_sec: float = Field(30.0, gt=0, le=300)
     notion_blocks_per_request: int = Field(100, ge=1, le=100)      # Notion: <= 100 children per request
 
+    # Notion OAuth (ADR-07, ADR-18) — gateway only. The client secret never leaves the gateway.
+    notion_client_id: str | None = None
+    notion_client_secret: SecretStr | None = None
+    notion_redirect_uri: str | None = None                         # must equal the URI registered in Notion
+    oauth_state_ttl_sec: int = Field(600, ge=30, le=3600)          # single-use OAuth state lifetime
+
+    @field_validator("notion_client_id", "notion_redirect_uri", mode="before")
+    @classmethod
+    def _empty_is_unset(cls, value):
+        return None if isinstance(value, str) and not value.strip() else (value.strip() if isinstance(value, str) else value)
+
+    @field_validator("notion_client_secret", mode="before")
+    @classmethod
+    def _empty_secret_is_unset(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("notion_redirect_uri")
+    @classmethod
+    def _valid_redirect_uri(cls, value):
+        if value is not None and (not value.startswith("https://") or "#" in value or any(c.isspace() for c in value)):
+            raise ValueError("must be an absolute https URL without a fragment")
+        return value
+
     @field_validator("notion_default_parent_id", mode="before")
     @classmethod
     def _valid_parent_id(cls, value):
+        """A Notion page ID (32 hex, dashes optional) or a Notion page URL ending in that ID."""
         if value is None or (isinstance(value, str) and not value.strip()):
             return None
-        text = str(value).strip().replace("-", "")
+        text = str(value).strip()
+        if text.startswith("https://"):
+            match = re.search(r"([0-9a-fA-F]{32})(?:[?#].*)?$", text.split("?")[0].replace("-", ""))
+            if not match:
+                raise ValueError("a Notion page URL must end with the page's 32-character ID")
+            text = match.group(1)
+        text = text.replace("-", "")
         if len(text) != 32 or any(c not in "0123456789abcdefABCDEF" for c in text):
-            raise ValueError("must be a Notion page ID (32 hex characters, dashes optional)")
+            raise ValueError("must be a Notion page ID (32 hex characters, dashes optional) or a Notion page URL")
         return str(uuid.UUID(text))
+
+    @property
+    def notion_oauth_configured(self) -> bool:
+        return bool(self.notion_client_id and self.notion_client_secret and self.notion_redirect_uri)
 
     @property
     def effective_worker_id(self) -> str:

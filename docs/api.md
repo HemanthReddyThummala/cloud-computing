@@ -17,7 +17,7 @@ Request headers: `Content-Type: application/json` (required), `Idempotency-Key` 
 
 ```json
 { "youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-  "notion_token": "<token from the extension's OAuth flow>",
+  "notion_token": "<sealed token from POST /oauth/notion/callback (nva1.…), or a raw Notion token>",
   "notion_parent_id": "optional Notion page id (32 hex, dashes optional)" }
 ```
 
@@ -30,12 +30,16 @@ Request headers: `Content-Type: application/json` (required), `Idempotency-Key` 
 Replaying the same `Idempotency-Key` with the same body (within `IDEMPOTENCY_KEY_TTL_HOURS`) returns the
 **original** 202 body and `Location`, plus header `Idempotent-Replayed: true`. No new job is created.
 
+The extension (ADR-20) always sends `Idempotency-Key: vna:<videoId>:<uuid>` and reuses it on the next
+click when the previous attempt's outcome was unknown (network error, timeout). It then follows the job
+with `GET /jobs/{job_id}` alone, which already contains `result`, `warnings`, `error` and `retry`.
+
 | Status | `error.code` | When |
 |---|---|---|
 | 400 | `INVALID_JSON` | body is not JSON |
 | 400 | `INVALID_REQUEST` | not an object, missing/extra/wrong-typed field |
 | 400 | `INVALID_YOUTUBE_URL` | not a YouTube video URL with an 11-char id |
-| 400 | `INVALID_NOTION_TOKEN` | empty or contains whitespace |
+| 400 | `INVALID_NOTION_TOKEN` | empty, contains whitespace, or a sealed token (`nva1.`) that fails to unseal |
 | 400 | `INVALID_NOTION_PARENT_ID` | not a Notion page id |
 | 400 | `INVALID_IDEMPOTENCY_KEY` | malformed header |
 | 413 | `PAYLOAD_TOO_LARGE` | body > 16 KiB |
@@ -45,7 +49,58 @@ Replaying the same `Idempotency-Key` with the same body (within `IDEMPOTENCY_KEY
 | 503 | `BROKER_UNAVAILABLE` / `DATABASE_UNAVAILABLE` | dependency down; nothing was created |
 
 The gateway does no pipeline work. The token is placed, encrypted, in a per-job RabbitMQ credential
-mailbox; it is never stored in PostgreSQL (ADR-03).
+mailbox; it is never stored in PostgreSQL (ADR-03). A sealed token is unsealed first, so only the real
+Notion token enters the mailbox (ADR-18).
+
+---
+
+## POST /oauth/notion/authorize — start Notion OAuth (ADR-18)
+
+No body. **200** (header `Cache-Control: no-store`):
+
+```json
+{ "authorization_url": "https://api.notion.com/v1/oauth/authorize?client_id=…&response_type=code&owner=user&redirect_uri=…&state=…",
+  "state": "single-use random value", "redirect_uri": "https://<extension-id>.chromiumapp.org/notion",
+  "expires_in": 600 }
+```
+
+Caller: the extension's background service worker (ADR-19), which has a host permission for the
+gateway, so no CORS is needed. The extension opens `authorization_url` with `chrome.identity.launchWebAuthFlow`. Notion redirects to
+`redirect_uri` (intercepted by Chrome) with `code` + `state`, or `error` + `state`.
+
+## POST /oauth/notion/callback — finish Notion OAuth
+
+The extension forwards what Notion returned:
+
+```json
+{ "state": "…", "code": "…" }        or        { "state": "…", "error": "access_denied" }
+```
+
+The state is consumed on every call (single use). The gateway exchanges the code with Notion
+server-side (client secret never leaves the gateway). **200** (`Cache-Control: no-store`):
+
+```json
+{ "notion_token": "nva1.…", "token_format": "sealed-v1",
+  "workspace_id": "…", "workspace_name": "…", "bot_id": "…" }
+```
+
+`notion_token` is **sealed** (encrypted by the gateway); the extension stores it as-is and sends it in
+`POST /jobs`. The raw access token, refresh token and code are never returned or logged.
+
+| Status | `error.code` | When |
+|---|---|---|
+| 400 | `OAUTH_INVALID_REQUEST` | body not JSON / missing `state` / wrong types |
+| 400 | `OAUTH_STATE_INVALID` | state unknown, expired or already used |
+| 400 | `OAUTH_ACCESS_DENIED` | the user cancelled (`error=access_denied`) |
+| 400 | `OAUTH_AUTHORIZATION_FAILED` | Notion returned another `error` |
+| 400 | `OAUTH_CODE_MISSING` | neither `code` nor `error` given |
+| 400 | `OAUTH_EXCHANGE_FAILED` | Notion rejected the code (e.g. expired / reused) — restart |
+| 502 | `OAUTH_CLIENT_REJECTED` | Notion rejected the client ID/secret (gateway misconfiguration) |
+| 502 | `NOTION_UNAVAILABLE` / `NOTION_UNREACHABLE` | Notion 5xx / network error |
+| 502 | `OAUTH_EXCHANGE_FAILED` | Notion's response had no access token |
+| 503 | `NOTION_RATE_LIMITED` | Notion 429 or our limiter; `Retry-After` header |
+| 503 | `OAUTH_NOT_CONFIGURED` | client ID/secret/redirect URI not set (also for `/authorize`) |
+| 503 | `OAUTH_STATE_STORE_UNAVAILABLE` | Redis down (also for `/authorize`) |
 
 ---
 

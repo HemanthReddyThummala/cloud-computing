@@ -13,10 +13,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from notesagent.common.broker import BrokerClient
 from notesagent.common.config import Settings, get_settings
-from notesagent.common.crypto import CredentialCipher
+from notesagent.common.crypto import CredentialCipher, TokenSealer
 from notesagent.common.db import open_pool
 from notesagent.common.errors import ApiError
 from notesagent.common.logging import setup_logging
+from notesagent.common.ratelimit import RateLimiter
+from notesagent.gateway.oauth import router as oauth_router
 from notesagent.gateway.routes import router
 from notesagent.gateway.submission import JobSubmissionService
 
@@ -41,13 +43,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await broker.start(wait=False)
         redis_client = aioredis.from_url(settings.redis_url.get_secret_value(),
                                          socket_timeout=2, socket_connect_timeout=2)
-        cipher = CredentialCipher(settings.job_payload_encryption_key.get_secret_value()
-                                  if settings.job_payload_encryption_key else "")
+        key = settings.job_payload_encryption_key.get_secret_value() if settings.job_payload_encryption_key else ""
+        cipher = CredentialCipher(key)
+        sealer = TokenSealer(key) if key else None                     # sealed OAuth tokens (ADR-18)
         app.state.settings = settings
         app.state.pool = pool
         app.state.broker = broker
         app.state.redis = redis_client
-        app.state.submissions = JobSubmissionService(pool, broker, cipher, settings)
+        app.state.sealer = sealer
+        app.state.limiter = RateLimiter(redis_client, settings)        # shared Notion limit for the token exchange
+        app.state.oauth_transport = None                               # tests may inject an httpx transport
+        app.state.submissions = JobSubmissionService(pool, broker, cipher, settings, sealer)
         log.info("gateway started")
         try:
             yield
@@ -79,4 +85,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return _error(500, "INTERNAL_ERROR", "An unexpected error occurred.")
 
     app.include_router(router)
+    app.include_router(oauth_router)                                   # Notion OAuth (ADR-18)
     return app

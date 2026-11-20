@@ -1,0 +1,29 @@
+/* "Take Notes" button in YouTube's player toolbar (content.js). */
+.ytp-button.vna-take-notes {
+  width: auto;
+  min-width: 0;
+  padding: 0 10px;
+  margin: 0 4px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+  font: 500 13px/1 Roboto, Arial, sans-serif;
+  white-space: nowrap;
+  vertical-align: top;
+  height: 28px;
+  margin-top: 10px;
+  opacity: 1;
+}
+
+.ytp-button.vna-take-notes:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.ytp-button.vna-take-notes:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+
+.ytp-button.vna-take-notes[data-state="error"] {
+  background: rgba(207, 34, 46, 0.85);
+}
