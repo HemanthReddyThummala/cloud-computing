@@ -179,7 +179,7 @@ def test_configured_timeout_reaches_the_sdk_request_and_server_deadline(monkeypa
     assert reply.text == '{"ok": true}' and reply.prompt_tokens == 12
     assert request.headers["X-Server-Timeout"] == header                  # Google's server deadline
     assert request.extensions["timeout"]["read"] == pytest.approx(timeout)  # client-side timeout
-    assert request.url.path.endswith("/models/gemini-3.8-flash:generateContent")
+    assert request.url.path.endswith("/models/gemini-3.5-flash-lite:generateContent")
     assert len(seen) == 1                                                 # SDK retries stay disabled
 
 

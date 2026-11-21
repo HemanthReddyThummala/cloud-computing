@@ -2,7 +2,8 @@
 #   docker compose up -d --build                 # gateway, outbox publisher, 2 workers + infra
 #   docker compose up -d --scale worker=3        # scale workers
 #   docker compose --profile test run --rm tests # integration tests (isolated DB / vhost / Redis db)
-# All values come from .env (never committed). Scalable services have no container_name.
+# Runtime values come from .env except the approved production Gemini model pinned for workers.
+# Scalable services have no container_name.
 name: notes-agent
 
 x-backend: &backend
@@ -184,7 +185,7 @@ services:
       TRANSCRIPT_LANGUAGES: ${TRANSCRIPT_LANGUAGES:-en}
       # SUMMARIZING stage (ADR-06, ADR-15). The key is a secret: never printed or logged.
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      GEMINI_MODEL: gemini-3.5-flash-lite
       GEMINI_THINKING_LEVEL: ${GEMINI_THINKING_LEVEL:-low}
       GEMINI_REQUEST_TIMEOUT_SEC: ${GEMINI_REQUEST_TIMEOUT_SEC:-300}
       GEMINI_UNAVAILABLE_BACKOFF_SEC: ${GEMINI_UNAVAILABLE_BACKOFF_SEC:-60,180,600}

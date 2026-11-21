@@ -64,9 +64,9 @@ class Settings(BaseSettings):
     max_attempts: int = Field(5, ge=1)
     infra_max_attempts: int = Field(20, ge=1)
 
-    # Shared external-API rate limiter (ADR-13). Gemini values are ENFORCED AS GIVEN: they already
-    # include the safety margin (user's AI Studio limits for gemini-3.8-flash x 0.8). RPD resets at
-    # midnight Pacific. Notion: requests per second per connection (documented average: 3/s).
+    # Shared external-API rate limiter (ADR-13). Gemini values are ENFORCED AS GIVEN and unchanged;
+    # their safety margin was set for gemini-3.8-flash and has not been revalidated for Flash-Lite.
+    # RPD resets at midnight Pacific. Notion: requests per second per connection (documented average: 3/s).
     gemini_rpm_limit: int = Field(4, ge=1)
     gemini_tpm_limit: int = Field(200_000, ge=1)
     gemini_rpd_limit: int = Field(16, ge=1)
@@ -86,7 +86,7 @@ class Settings(BaseSettings):
 
     # SUMMARIZING stage (ADR-06, ADR-15). Free tier only; the key is never logged (SecretStr).
     gemini_api_key: SecretStr | None = None
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
     gemini_thinking_level: str = "low"
     # Per-request timeout. The SDK also sends it to Google as the server deadline (X-Server-Timeout),
     # so a too-short value turns slow generations into HTTP 504 (2026-11-20 diagnosis, ADR-21).
@@ -194,7 +194,7 @@ class Settings(BaseSettings):
     @classmethod
     def _valid_model(cls, value: str) -> str:
         if not value.strip() or not all(c.isalnum() or c in "-._" for c in value.strip()):
-            raise ValueError("must be a Gemini model name such as gemini-3.8-flash")
+            raise ValueError("must be a Gemini model name such as gemini-3.5-flash-lite")
         return value.strip()
 
     @field_validator("transcript_languages")

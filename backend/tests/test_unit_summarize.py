@@ -95,7 +95,7 @@ def test_short_transcript_one_request_with_grounded_timestamps_and_captions():
     gem = StubGemini(rec)
     cp = run(gem, rec, segs(6))
     assert cp["chunk_count"] == 1 and cp["gemini_requests"] == 1 and len(gem.prompts) == 1
-    assert cp["model"] == "gemini-3.8-flash" and cp["summary"].startswith("Part covering segments 0-5")
+    assert cp["model"] == "gemini-3.5-flash-lite" and cp["summary"].startswith("Part covering segments 0-5")
     assert cp["key_points"] == ["Key point from segment 0", "Key point from segment 5"]
     assert [(s["title"], s["start_sec"]) for s in cp["sections"]] == [("Section at 0", 0.0), ("Section at 3", 15.0)]
     ts = cp["important_timestamps"]
@@ -281,7 +281,7 @@ def test_log_redaction_removes_google_keys():
 def test_configuration_defaults_and_validation():
     s = get_settings()
     assert (s.gemini_model, s.gemini_thinking_level, s.transcript_chunk_tokens, s.max_frames) == \
-           ("gemini-3.8-flash", "low", 12000, 8)
+           ("gemini-3.5-flash-lite", "low", 12000, 8)
     for bad in ({"gemini_thinking_level": "turbo"}, {"gemini_model": "bad model!"},
                 {"transcript_chunk_tokens": 100}, {"max_frames": -1}):
         with pytest.raises(SystemExit):
