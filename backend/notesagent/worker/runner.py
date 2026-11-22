@@ -56,6 +56,7 @@ from notesagent.common.http_errors import classify_exception
 from notesagent.common.ratelimit import RateLimiter
 from notesagent.common.states import JobStatus
 from notesagent.worker import retry_policy
+from notesagent.worker.demo_faults import DemoFaults
 from notesagent.worker.dlq_audit import DeadLetterAuditor
 from notesagent.worker.stages import StageContext, StageRegistry
 
@@ -108,6 +109,7 @@ class JobWorker:
         self.broker: BrokerClient | None = None
         self.redis: aioredis.Redis | None = None
         self.limiter: RateLimiter | None = None
+        self.demo_faults: DemoFaults | None = None              # ADR-22: only if DEMO_FAULTS_ENABLED=true
         self._slot = asyncio.Lock()
 
     # ------------------------------------------------------------ lifecycle
@@ -118,6 +120,9 @@ class JobWorker:
         self.redis = aioredis.from_url(self.settings.redis_url.get_secret_value(),
                                        socket_timeout=2, socket_connect_timeout=2)
         self.limiter = RateLimiter(self.redis, self.settings)     # ADR-13, shared by all workers via Redis
+        if self.settings.demo_faults_enabled:                     # ADR-22: disabled by default
+            self.demo_faults = DemoFaults(self.redis)
+            log.warning("demo faults ENABLED (demonstrations only)", extra={"worker_id": self.worker_id})
         assert self.broker.connection is not None
         consume_channel = await self.broker.connection.channel(publisher_confirms=False)
         await consume_channel.set_qos(prefetch_count=1)          # one job at a time per worker
@@ -131,7 +136,10 @@ class JobWorker:
         if await self._legacy_queue_exists():
             drain = asyncio.create_task(self._drain_legacy_queue(stop))
         log.info("worker started", extra={"worker_id": self.worker_id, "stages": sorted(self.stages),
-                                          "work_queue": QUEUE_WORK, "draining_legacy": drain is not None})
+                                          "work_queue": QUEUE_WORK, "draining_legacy": drain is not None,
+                                          # ADR-23: the limiter namespace label only (never the key)
+                                          "gemini_limiter_namespace": self.settings.gemini_limiter_namespace
+                                          or "(default)"})
         try:
             await stop.wait()
         finally:
@@ -353,7 +361,8 @@ class JobWorker:
                        "message": f"The {status.value} stage is not available in this build of the worker."})
 
         ctx = StageContext(job_id=job_id, job=job, checkpoints=dict(checkpoints), worker_id=self.worker_id,
-                           _credential_reader=lambda: self._read_credential(job_id), limiter=self.limiter)
+                           _credential_reader=lambda: self._read_credential(job_id), limiter=self.limiter,
+                           demo_faults=self.demo_faults)
         log.info("stage started", extra={"job_id": str(job_id), "stage": status})
         try:
             output = await stage(ctx)

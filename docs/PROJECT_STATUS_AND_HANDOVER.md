@@ -1,11 +1,12 @@
 # Project status and handover — Distributed Multimodal Video Note-Taking Agent
 
 **This file is the single source of truth for project status.**
-- Last updated: **2026-11-21 17:43 IST** (first Flash-Lite end-to-end job failed at Notion publishing).
+- Last updated: **2026-11-22** (documentation cleanup of stale §3/§8 rows after all live failure demos;
+  the switch is off; ADR-23 is deployed to the workers with an empty namespace = the original keys).
 - Every session that changes implementation, tests, deployment or blockers updates this file at its end
   (rule recorded in `CLAUDE.md`).
 - Detailed evidence lives in `docs/session_logs/` (one log per session).
-- Design decisions live in `docs/decisions.md` (ADR-01 … ADR-21).
+- Design decisions live in `docs/decisions.md` (ADR-01 … ADR-23).
 - API contract: `docs/api.md`. Specification: `PROJECT_SPEC.pdf` (authoritative).
 - A root-level `handover.md` also exists from a same-day session. It is **not maintained**; this file
   supersedes it.
@@ -71,36 +72,43 @@ Key decisions (full text in `docs/decisions.md`):
 | 14–17 | One ADR per stage. Constraint A in TRANSCRIBING; grounded timestamps; real frames only; Notion page reconciled before every write (no duplicates) |
 | 18/19/20 | Gateway-only OAuth with **sealed token** (`nva1.`) in the extension; background-only sign-in; Take Notes + polling + popup |
 | **21** | **Gemini 503/504:** keep sanitized provider status (`http_status`, `provider_code`), backoff `60,180,600` (Retry-After honoured, capped 1 h), request timeout 300 s (also Google's server deadline), clear popup text |
+| **22** | **Demo fault switch:** `DEMO_FAULTS_ENABLED` (worker only, default false) + one-shot operator arming via the worker CLI; `dlq` / `gemini_429_once` / `frames_partial` / `frames_all` raise real-type exceptions at the provider boundary, so production retry, cooldown, warning and DLQ paths run; Redis errors → no fault; D-1 unchanged |
 
 ## 3. Feature status (verified against code, tests, logs and the running stack)
 
 | Area | Status | Evidence |
 |---|---|---|
 | Gateway API (R5), validation, idempotency keys, `/healthz` | ✅ Verified (real) + 🧪 | Real stack; backend suite |
-| Outbox, broker topology, ≥ 2 workers, crash recovery (R1, R6 crash) | ✅ real stack; crash tests with fixture stages | SIGKILL crash set 160/160 (2026-11-19). **Never** a real mid-job kill during real stages |
-| Retries, DLQ, broker dead-letter audit (R6 DLQ) | ✅ Verified (real) + 🧪 | 3 real jobs DEAD_LETTERED with DLQ copies (`jobs.dlq` = 3 messages) |
-| Shared rate limiter (R9) | 🧪 + ✅ counting verified | The real RPD counter matched the real requests exactly (→ 16/16 on 2026-11-20). Burst behaviour against real Gemini: **Unverified** |
-| TRANSCRIBING + constraint A (R3, R7-A) | ✅ Verified (real) | 3 real videos in real jobs (jNQXAC9IVRw 6, D26sUZ6DHNQ 334 ×2, _S-cBzAg0GE 213 segments); > 20 min rejection checked with real metadata (lowered limit) |
+| Outbox, broker topology, ≥ 2 workers, crash recovery (R1, R6 crash) | ✅ **Verified live (real job)** + 🧪 | **2026-11-22 rehearsal:** job `6141336d` (`fyTxwIa-1U0`); `worker-2` was SIGKILLed during EXTRACTING_FRAMES (exit 137). `worker-1` resumed it (`redelivered: true`, `delivery_count: 1`) and redid only that stage; the job ended COMPLETED 10.6 s after the kill (5/5 frames, `attempts` 0). Exactly 1 `POST /v1/pages`; the killed worker made 0 Notion requests. SIGKILL crash test set 160/160 (2026-11-19) |
+| Retries, DLQ, broker dead-letter audit (R6 DLQ) | ✅ Verified (real) + 🧪 | 5 real jobs DEAD_LETTERED with DLQ copies (**`jobs.dlq` = 5 messages**, checked 2026-11-22). By last cause:<br>• `acffab62`, `f87c737a`: `GEMINI_HTTP_503`<br>• `82960179`, `44df00c0`: `GEMINI_DAILY_LIMIT_REACHED`<br>• `129af1de`: `YOUTUBE_UNREACHABLE` (the live DLQ demo, 3 attempts) |
+| Shared rate limiter (R9) | 🧪 + ✅ counting verified | The real RPD counter matched the real requests exactly (→ 16/16 on 2026-11-20). **Controlled burst verified live (2026-11-22, 3 clicks):**<br>• jobs `98d54889`, `37cb68ab`, `c35f1c13` submitted within 4.6 s; queued across 2 workers (the 3rd waited 15 s)<br>• all `COMPLETED` with 1 Notion page each; drained in 97 s<br>• **0 LLM 429s**, 0 local-limiter waits<br>• 4 Gemini requests (one real 503 → 60 s backoff); limiter 8 → 12<br>Log: `burst_evaluation.md`<br>**Live pacing above RPM 4** (≥ 5 requests in 60 s): **not exercised** (tests only) |
+| Per-project Gemini limiter namespace (ADR-23, `GEMINI_LIMITER_NAMESPACE`) | 🧪 implemented + tested (28 tests); ✅ **deployed to the workers 2026-11-22** (namespace empty) | Empty (default) = the original keys byte-for-byte. `alt` → `ratelimit:gemini-alt:{rpm,tpm,rpd:<day>}` + `ratelimit:cooldown:gemini-alt`. Notion/YouTube keys unchanged. Use with a real alternate key: **Unverified** |
+| TRANSCRIBING + constraint A (R3, R7-A) | ✅ Verified (real) + **user-reported** | Real transcripts in several real jobs. **User-reported (2026-11-21):** a video **longer than 20 minutes** was handled as expected; record `7c34510e` (`jS9rBienEFQ`) is `FAILED` `VIDEO_TOO_LONG`. A video **without captions** was handled as expected; record `d016a28e` (`KXpHt1FvxZE`) is `FAILED` `YOUTUBE_TRANSCRIPT_UNAVAILABLE` |
 | SUMMARIZING (Gemini) (R3) | ✅ **Verified in one real short-video job** | `gemini-3.5-flash-lite` completed one structured request (one chunk, one API request): non-empty summary, 3 key points, 3 timestamped sections, and 4 visual moments. The job proceeded to frame extraction; multi-chunk/merge and completed-job behavior remain **Unverified**. Earlier `gemini-3.8-flash` failures remain unexplained. See §5 |
 | ADR-21 Gemini 503/504 handling | ✅ **Deployed**; 🧪 tested; behaviour checked **offline in the deployed worker** | 2026-11-21: delays 60/180/600/600, Retry-After cap 3600, `X-Server-Timeout: 300` via the real SDK with a mock transport. **Not yet exercised by a real Gemini failure** |
 | EXTRACTING_FRAMES (R3, R7-B) | ✅ Verified in one real job + 🧪 | One job downloaded the source and produced 4/4 JPEG frames; byte length, JPEG signature and SHA-256 verified from the durable checkpoint. All frame timestamps matched grounded visual moments. No Notion page was published. |
-| PUBLISHING to Notion (R3, R6 no duplicates) | 🔴 **One real attempt failed** + 🧪 | The first Flash-Lite end-to-end job failed in `PUBLISHING` with `NOTION_OBJECT_NOT_FOUND` ("The Notion page was not found or not shared with the connection."); no page URL/result was recorded. Fake Notion API tests incl. SIGKILL mid-append. Real page contents remain **Unverified**. |
-| Graceful degradation (R6) | 🧪 Tested (fakes) only | — |
+| PUBLISHING to Notion (R3) | ✅ **Working, per user-reported manual test** + 🧪 | **User-reported (2026-11-21):** a normal Take Notes run generated notes and uploaded them to Notion. Database records are consistent with this: jobs `cb5eb8e1` (`fyTxwIa-1U0`, 419 s) and `a9ef5656` (`D26sUZ6DHNQ`, 724 s) are `COMPLETED` with a result. Earlier jobs `574eb00f` and `f143c18a` failed with `NOTION_OBJECT_NOT_FOUND` (destination page not found or not shared) before the successful runs. Page contents were checked by the user, not by Claude |
+| No duplicate Notion page under crash/redelivery (R6) | ✅ Verified live for a crash during EXTRACTING_FRAMES + 🧪 | 2026-11-22: one page-creation request for the crashed-and-recovered job. A crash *during* PUBLISHING (reconciliation) is tested with fakes only |
+| Graceful degradation (R6) | ✅ **Verified live (2026-11-22, ADR-22 demo switch)** + 🧪 | **Partial frame failure** (`frames_partial`, job `82c49d33`, `M988_fsOSWo`):<br>• `COMPLETED_WITH_WARNINGS`, **4/7 frames published**<br>• 3 `FRAME_EXTRACTION_FAILED` warnings (`DEMO_INJECTED_FAILURE`)<br>• 1 Notion page with 4 images<br>**All frames failed** (`frames_all`, job `74779edd`, `TlHvYWVUZyc`):<br>• `COMPLETED_WITH_WARNINGS`, **0/4 frames published**<br>• 4 warnings<br>• **text-only Notion page** (0 file uploads)<br>The failures were injected at the frame boundary; the degradation, warnings and publishing are the production code. Logs: `frames_partial_demo.md`, `frames_all_demo.md` |
 | Notion OAuth, gateway (ADR-18) | ✅ Verified (real) | Gateway log "notion authorization completed" after the user's real sign-in (2026-11-20) |
-| Extension sign-in, Take Notes, submission, polling, popup (R2) | ✅ partly real + 🧪 | Real Chrome: sign-in done, 3 real jobs submitted via Take Notes (`vna:` idempotency keys), popup showed "Failed after retries". 94 Node tests |
-| Popup wording for Gemini 503/504 (ADR-21) | 🧪 | Extension tests. **Needs an extension reload in Chrome**; not yet seen in Chrome |
-| README (R8) | ⬜ **Not implemented** | Only `extension/README.md` exists |
-| Live demo of R6 (429 from all three APIs, worker kill, DLQ demo profile) | ⬜ Not prepared | Mechanisms exist and are tested with fakes |
-| Latency near the 20-min cap (R9) | ⬜ Not measured | — |
+| Extension sign-in, Take Notes, submission, polling, popup (R2) | ✅ real (user-reported) + 🧪 | Real Chrome: sign-in done; Take Notes submitted several real jobs. **User-reported (2026-11-21):** a normal run completed and its notes appeared in Notion, and the over-20-minute and no-captions runs were handled as expected. 94 Node tests (re-run 2026-11-21: 94/94) |
+| Popup wording for Gemini 503/504 (ADR-21) | 🧪 + ✅ terminal case verified with real gateway data (outside Chrome) | Extension tests cover the waiting and terminal 503 text (94/94, 2026-11-22).<br>• **2026-11-22:** the real `GET /jobs` responses of the two 503-dead-lettered jobs (`acffab62`, `f87c737a`) were run through the extension's `sanitizeStatus` + `describeJob` (Node) → "Failed after retries … Last cause: the AI model is temporarily unavailable (overloaded). Please try again later."<br>• The **waiting** variant has not been seen with real data, and **neither variant has been seen in Chrome**: the popup keeps only the last 10 jobs, and today's 503 jobs completed.<br>• **User-reported (2026-11-22):** the extension was reloaded in Chrome and the popup shows no errors (load and render OK; 503 text not visible)<br>• **Not shown:** the next-retry time.<br>Log: `extension_503_ui_verification.md` |
+| README (R8) | ✅ **Written** (2026-11-21) | Root `README.md`: base URL, health check, default Notion destination behaviour, every required env var (LLM key/model, rate limits, Notion OAuth credentials, broker URL, retry/backoff), setup, extension loading, API summary, scaling/kill commands, tests. Variable/service mapping verified against `docker compose config`; not yet followed end-to-end on a clean machine |
+| Failure demonstrations (R6, spec §6) + scaling (R8) | ✅ **All deployed and rehearsed live (2026-11-22):**<br>• scaling<br>• crash recovery<br>• DLQ<br>• partial frames<br>• all frames<br>• Gemini 429<br>The ADR-22 switch is deployed on the workers and **off** | Runbook `docs/FAILURE_DEMONSTRATION_RUNBOOK.md`. Live evidence:<br>• **DLQ:** job `129af1de` → `DEAD_LETTERED` after 3 attempts, `jobs.dlq` 4 → 5, 0 external calls<br>• **Partial and all frames:** see "Graceful degradation"<br>• **Gemini 429:** job `6649512b`, 1 simulated 429 (no Google call), 20 s shared cooldown, retry through the limiter → `COMPLETED`, 1 Notion page. A real Gemini 503 on the retry added one ADR-21 backoff<br>• YouTube/Notion 429: automated tests (5-A) only<br>Logs: `dlq_demo_rehearsal_success.md`, `frames_partial_demo.md`, `frames_all_demo.md`, `gemini_429_once_demo.md`. Earlier evidence: **Crash recovery:** job `6141336d`, SIGKILL during EXTRACTING_FRAMES → resumed by the other worker → COMPLETED, one Notion page. **Scaling:** 2 → 3 → 2. **Demo fault switch (ADR-22):** `dlq`, `gemini_429_once`, `frames_partial`, `frames_all`; off by default (`DEMO_FAULTS_ENABLED`, worker only); one-shot arming via the worker CLI; injects real-type exceptions at the provider boundary; 21 new tests pass |
+| Latency near the 20-min cap (R9) | ✅ **Measured live (2026-11-22)**, one real job | Job `b3a24d11` (`rdb2ki4iGuo`, **19:16**):<br>• **267.6 s** end-to-end (`created_at` → `finished_at`), `COMPLETED`, 4/4 frames, 1 Notion page, 0 warnings<br>• **240.3 s** of it was ADR-21 backoff after **two real Gemini 503s**<br>• processing excluding those waits ≈ **27.3 s** (derived, not a separate run)<br>• 1 chunk (8,801 estimated tokens < 12,000), so **no merge request**<br>• 3 Gemini requests; limiter 5 → 8<br>Log: `latency_evaluation_near_cap.md` |
 
 ## 4. Tests (exact latest results)
 
 | Suite | Result | When |
 |---|---|---|
-| Backend full suite (Docker, real PostgreSQL / RabbitMQ / Redis, fake providers) | **902 passed, 0 failed** (775 s; 888 + 14 contract tests) | 2026-11-21 13:42–13:55 IST (production code unchanged = deployed `13a9334`) |
+| Backend full suite (Docker, real PostgreSQL / RabbitMQ / Redis, fake providers), final pre-submission run on the working tree | **951 passed, 0 failed** (830.7 s) | 2026-11-22, ended 16:14 IST (`spec_compliance_review.md`) |
+| Backend full suite with ADR-23 (first run) | 951 passed, 0 failed (859 s; 923 + 28 limiter-namespace tests) | 2026-11-22 13:57–14:11 IST |
+| Backend full suite (previous) with ADR-22 | 923 passed, 0 failed (871 s; 902 + 13 unit + 8 integration demo-fault tests) | 2026-11-22 03:17–03:31 IST |
+| Backend full suite (previous) on commit `14811c4` (Flash-Lite switch, committed by the user 2026-11-21 23:52) + doc-only changes | **896 passed, 2 failed, 4 errors**: all 6 were RabbitMQ management-API timeouts while the host was suspended mid-run (18:47 pytest time vs 2 h 25 min wall). **Re-run of the two affected files: 28 passed, 0 failed**, so all 902 tests have passed | 2026-11-21 23:54 → 2026-11-22 02:24 IST |
+| Backend full suite (previous) | 902 passed, 0 failed (775 s) | 2026-11-21 13:42–13:55 IST (`13a9334`) |
 | Gemini SDK contract tests (`test_unit_gemini_sdk_contract.py`: real SDK request/response path, mock transport; request shape; 503/504/400/401/403/429/quota; structured-JSON success through the real stage) | **14 passed** | 2026-11-21 (503 investigation) |
 | Focused Gemini summarization/unit tests (summarize, failures, SDK contract) | **71 passed, 0 failed** (1.96 s; offline/mocked) | 2026-11-21 (model switch) |
-| Extension `cd extension && npm test` (Node, fake chrome + local fake gateway) | **94 passed**, 0 failed | 2026-11-21 (re-run in the deployment session) |
+| Extension `cd extension && npm test` (Node, fake chrome + local fake gateway) | **94 passed**, 0 failed | 2026-11-22 (ADR-22 session; re-run in the 503 UI verification; no extension change) |
 | Extension ↔ real gateway (fake Notion) cross-check | 10/10 PASS | 2026-11-20 (Phase C Part 3) |
 | Deployed-worker configuration check (no network) | delays [60, 180, 600, 600]; 5th → DEAD_LETTERED with `last_provider_code` UNAVAILABLE; Retry-After 999999 → 3600; YouTube 503 → 10 s; SDK `X-Server-Timeout` 300 | 2026-11-21 deployment |
 
@@ -113,7 +121,37 @@ Commands:
 
 Tests never call real Gemini, YouTube or Notion.
 
-## 5. Gemini model switch: Flash-Lite reached frame extraction in a real job; Notion publishing failed
+## 5. Latest manual test results (user-reported, 2026-11-21)
+
+These were performed by the user in real Chrome on the running stack. They were **not** independently
+verified by Claude; the job records listed are read-only database observations that are consistent with
+them.
+
+| Scenario | User-reported outcome | Consistent job record(s) |
+|---|---|---|
+| Normal video: Take Notes → notes generated → uploaded to Notion | Success | `cb5eb8e1` (`fyTxwIa-1U0`, 7:00) and `a9ef5656` (`D26sUZ6DHNQ`, 12:04): `COMPLETED`, result present, 0 warnings |
+| Video longer than 20 minutes | Handled as expected (rejected) | `7c34510e` (`jS9rBienEFQ`): `FAILED` `VIDEO_TOO_LONG` |
+| Video without captions (CC) | Handled as expected (rejected) | `d016a28e` (`KXpHt1FvxZE`): `FAILED` `YOUTUBE_TRANSCRIPT_UNAVAILABLE` |
+
+**Unattributed burst, 2026-11-21 21:27 UTC (read-only investigation, `job_44df00c0_origin_investigation.md`):**
+- four jobs were submitted within 7 s from the host's single browser connection (`172.18.0.1:43732`);
+- all carry the extension's Take Notes idempotency-key format (`vna:<videoId>:<uuid>`, 52 chars);
+- none was submitted by Claude.
+
+| Job | Video | Outcome |
+|---|---|---|
+| `139874ed` | `NvZEZ-mZsuI` | `COMPLETED` |
+| `44df00c0` | `favi7avxIag` | `DEAD_LETTERED`: a real Gemini 503 on attempt 1, then the local daily limit on attempts 2–4 |
+| `8513c17f` | `TlHvYWVUZyc` | `COMPLETED` |
+| `5478d8b0` | `M988_fsOSWo` | `COMPLETED` after one YouTube 403 frame retry |
+
+These jobs took the Gemini counter from 12 to 16/16. **Which person clicked cannot be determined:**
+jobs carry no user identity.
+
+The earlier `NOTION_OBJECT_NOT_FOUND` failures (`574eb00f`, `f143c18a`) preceded the successful
+publishes. Their history is kept below; Notion publishing is not currently considered broken.
+
+## 5a. Gemini model switch history: Flash-Lite reached frame extraction in a real job; Notion publishing failed (since resolved, see §5)
 
 - **Production switch (2026-11-21 16:59 IST):**
   - `docker-compose.yml` now pins the worker `GEMINI_MODEL` to `gemini-3.5-flash-lite`, overriding any
@@ -297,7 +335,60 @@ Tests never call real Gemini, YouTube or Notion.
 
 ## 6. Deployment status
 
-- **Worker-only deployment (2026-11-21 16:59 IST):** worker ×2 runs image
+- **All demo windows on 2026-11-22 are closed:** `frames_partial` (08:55–08:58 UTC), `frames_all`
+  (09:02–09:04) and `gemini_429_once` (09:10–09:15).
+  - The workers were recreated on `36c573002412` for each.
+  - **Current containers:** worker-1 `c689d72e8a0a`, worker-2 `0929e6ddf9ee`, both healthy, 0 restarts.
+  - **Config:** `DEMO_FAULTS_ENABLED=false`, `MAX_ATTEMPTS=5`, namespace empty, limits 4/200000/16
+    (verified); `arm` is refused.
+  - Other services are identical to the baseline.
+  - Inert job-bound demo keys (`82c49d33…`, `74779edd…`, `6649512b…` + its `gemini_429_done` marker)
+    expire on their own (2 h TTL).
+  - Gemini limiter today: `ratelimit:gemini:rpd:2026-11-22` = 5/16.
+
+- **Worker-only ADR-23 deployment (2026-11-22 14:19:49–14:19:51 IST = 08:49:49 UTC):**
+  - worker-1 `6666e84c8f6a` and worker-2 `5bac36ad32ba` now run image **`36c573002412`**
+    (`notes-agent-backend:dev`, ADR-22 + ADR-23); both healthy, 0 restarts.
+  - **Effective config on both** (env and loaded settings):
+    - `GEMINI_LIMITER_NAMESPACE` empty, so the limiter keys are the original
+      `ratelimit:cooldown:gemini`, `ratelimit:gemini:{rpm,tpm,rpd:<day>}`;
+    - `DEMO_FAULTS_ENABLED=false`, `MAX_ATTEMPTS=5`;
+    - limits 4/200000/16;
+    - `GEMINI_MODEL=gemini-3.5-flash-lite`;
+    - API key present (boolean only).
+  - **Startup logs:** 2 × "worker started" with `gemini_limiter_namespace "(default)"`; 0 "demo faults
+    ENABLED"; 0 errors.
+  - The dry run showed only worker-1/worker-2.
+  - Gateway, publisher, postgres, rabbitmq and redis are **identical to the pre-deployment baseline**
+    (IDs, images, start times, 0 restarts, healthy).
+  - `/healthz` ok with exactly 2 live workers.
+  - The Redis Gemini counter `ratelimit:gemini:rpd:2026-11-21` is **unchanged at 16**; 0 namespaced
+    keys.
+  - **Rollback:** `docker tag notes-agent-backend:pre-adr23-workers notes-agent-backend:dev` (=
+    `78864607bddd`), then `docker compose up -d --no-deps --no-build --scale worker=2 worker`.
+  - **Not done:** the API key was not switched and `.env.gemini-alt` not used.
+
+- **Worker-only ADR-22 deployment (2026-11-22 03:36–03:37 IST = 2026-11-21 22:06 UTC):**
+  - worker ×2 now run image **`78864607bddd`** (`notes-agent-backend:dev`), built from the working tree
+    (50 backend files byte-identical) and **containing ADR-22**;
+  - previous worker image `6aad6362b38a` is kept as **`notes-agent-backend:pre-adr22-workers`** (rollback);
+  - effective config on **both** workers: `DEMO_FAULTS_ENABLED=false` (env and loaded settings),
+    `GEMINI_MODEL=gemini-3.5-flash-lite`; startup logged all four stages, no "demo faults ENABLED" line;
+  - recreated with `docker compose up -d --no-deps --no-build --scale worker=2 worker` after a dry run
+    that showed only worker-1/worker-2; `migrate` not run (no new migrations).
+- **DLQ demo window (2026-11-21 22:24–22:28 UTC):** the workers were recreated twice, on the same
+  image `78864607bddd`.
+  - **During the window:** `DEMO_FAULTS_ENABLED=true` and `MAX_ATTEMPTS=3`.
+  - **Afterwards:** restored to `false` and 5, verified in env and loaded settings.
+  - **Current containers:** worker-1 `07df16513cda`, worker-2 `47094d34563a`; both healthy, 0 restarts.
+  - **Leftover key:** one inert `demo:fault:job:129af1de…` key expires on its own (2 h TTL).
+- Gateway and outbox publisher unchanged on `2a01b00b9603`; PostgreSQL, RabbitMQ and Redis unchanged
+  (same IDs, start times, 0 restarts).
+- **Rollback:** `docker tag notes-agent-backend:pre-adr22-workers notes-agent-backend:dev`, then
+  `docker compose up -d --no-deps --no-build --scale worker=2 worker`.
+
+- Earlier worker-only deployment (2026-11-21 16:59 IST): Flash-Lite workers on `6aad6362b38a`.
+- (history) **Worker-only deployment (2026-11-21 16:59 IST):** worker ×2 runs image
   `notes-agent-backend:dev`, image ID `6aad6362b38a58dff512154d7a1807fe5551bf73521d473384ef29e89d69776f`,
   built from the current working tree. This image includes the updated application model default; no
   commit was created.
@@ -338,11 +429,23 @@ Tests never call real Gemini, YouTube or Notion.
 
 ## 8. Known limitations and open issues
 
-1. **End-to-end / Notion destination** (§5): one Flash-Lite job successfully transcribed, summarized,
-   and extracted four frames, then failed at `PUBLISHING` with `NOTION_OBJECT_NOT_FOUND`. No real
-   end-to-end COMPLETED job or published page exists to verify. Whether the configured Notion page is
-   missing or not shared with the connection remains unresolved. Multi-chunk/merge behavior and the
-   "no duplicate page" guarantee against real Notion are **Unverified**.
+1. **End-to-end:** normal jobs now complete and publish to Notion (user-reported, consistent records;
+   §5).
+   - **Live-verified 2026-11-22:**
+     - `COMPLETED_WITH_WARNINGS` in real jobs: `82c49d33` (4/7 frames) and `74779edd` (0/4 frames,
+       text-only page);
+     - no duplicate Notion page under worker crash recovery, **for a crash during
+       EXTRACTING_FRAMES** (job `6141336d`: worker SIGKILLed, resumed by the other worker, exactly one
+       page-creation request).
+   - **Automated-test evidence only:** a crash *during* PUBLISHING (page reconciliation).
+   - **Still Unverified:**
+     - multi-chunk transcripts with a merge request: **automated tests only**. The 19:16 evaluation
+       video (`b3a24d11`, 8,801 estimated tokens) fit in one chunk at the 12,000-token budget, and
+       ordinary videos under 20 minutes are not expected to split;
+     - live limiter pacing above RPM 4 (a burst of ≥ 5 Gemini requests in 60 s): tests only.
+       (The controlled **3-click burst** on 2026-11-22 drained with **no LLM 429**, but stayed
+       below RPM 4. The unplanned 4-job burst on 2026-11-21 also drained without a 429.)
+
    The unchanged Gemini limiter safety margin was originally based on `gemini-3.8-flash` and has not
    been revalidated for Flash-Lite.
 2. **Earlier end-to-end attempts were blocked by Gemini errors; the first Flash-Lite job reached Notion publishing but failed there.**
@@ -352,7 +455,7 @@ Tests never call real Gemini, YouTube or Notion.
      the single probe at 23:20 UTC **reached Google: 503 `UNAVAILABLE`**.
    - The separate first Flash-Lite job is recorded in §5; no further job or retry was made after its
      Notion publishing failure.
-3. **README missing (R8).**
+3. **README (R8)** written 2026-11-21. It has not yet been followed from scratch on a clean machine.
 4. **Quota:** a failing Gemini job can use 4–5 of the existing 16 daily requests; with ADR-21 it takes
    about 24 min to dead-letter. Model-specific Flash-Lite quota compatibility has not been revalidated.
 5. **Real Chrome:** YouTube DOM changes could hide the button. The service-worker lifetime during long
@@ -365,27 +468,71 @@ Tests never call real Gemini, YouTube or Notion.
 
 ## 9. Remaining mandatory work (priority order)
 
-1. **User:** reload the extension in Chrome (ADR-21 is deployed).
-2. **Resolve the Notion destination first:** verify that the configured default parent refers to an
-   existing page shared with the integration. Do not retry or submit another job until the user has
-   reviewed this result and authorized the next attempt. After resolution, validate Flash-Lite on a
-   controlled multi-chunk case (including one merge), then plan a short end-to-end job to verify a
-   completed Notion page, frames and no duplicate page.
-3. **README** (R8): base URL, default Notion destination (`NOTION_DEFAULT_PARENT_ID`), every env var
-   from §7, how to load the extension, the demo commands.
-4. **Live demos (R6/R9):**
-   - 429 handling for all three providers (decide how);
-   - kill a worker mid-job;
-   - DLQ with the demo profile (`BACKOFF_SCHEDULE_SEC=2,4,8`, `MAX_ATTEMPTS=3`);
-   - `--scale worker=N`;
-   - a burst of Take Notes clicks without an LLM 429;
-   - latency near the 20-min cap.
-5. Optional: Notion-side token revocation, a popup "clear finished jobs" action.
+1. ~~README~~ — done 2026-11-21 (root `README.md`).
+2. **Failure demonstrations (R6, spec §6):**
+   - **Done live (2026-11-22):**
+     - scaling;
+     - crash recovery;
+     - **DLQ (2-L)** via the demo fault switch: job `129af1de` reached `DEAD_LETTERED` after 3
+       attempts with `YOUTUBE_UNREACHABLE`; `jobs.dlq` went from 4 to 5; 0 YouTube/Gemini/Notion calls.
+     - **Frame degradation, partial (3-L `frames_partial`)**: job `82c49d33` (video `M988_fsOSWo`)
+       ended `COMPLETED_WITH_WARNINGS`:
+       - frames 7 requested / 4 published;
+       - 3 `FRAME_EXTRACTION_FAILED`/`DEMO_INJECTED_FAILURE` warnings (frames 1, 3, 5);
+       - 1 real Gemini request and 1 Notion page (4 images uploaded).
+     - **Frame degradation, all frames (3-L `frames_all`)**: job `74779edd` (video `TlHvYWVUZyc`)
+       ended `COMPLETED_WITH_WARNINGS`:
+       - frames 4 requested / **0 published**;
+       - 4 `DEMO_INJECTED_FAILURE` warnings;
+       - 1 Gemini request;
+       - **1 text-only Notion page** (0 file uploads).
+     - **Gemini 429 (5-L `gemini_429_once`)**: job `6649512b` (video `fyTxwIa-1U0`):
+       - exactly **1 simulated 429** (`RESOURCE_EXHAUSTED`, Retry-After 20 s, **no call to Google**),
+         classified as `GEMINI_RATE_LIMITED`;
+       - shared cooldown set (`PTTL` 19.1 s observed); retry after exactly 20 s through the limiter;
+       - **deviation:** the first real request then got a **real Gemini HTTP 503**, handled by ADR-21
+         (180 s backoff); the next real request succeeded (2 real requests, 1 successful);
+       - `COMPLETED`, `attempts` 2, frames 4/4, **exactly 1 Notion page**;
+       - limiter 2 → 5.
+       - YouTube/Notion 429 remain covered by the automated 5-A tests.
+   - **All live failure demonstrations are done.** The switch stays disabled.
+   - (The planned alternate-project route via ADR-23 was not needed: the original project's
+     limiter had budget on the new Pacific day. ADR-23 is deployed and inert, namespace empty.)
+3. **Evaluation items (R9):**
+   - ~~a burst of Take Notes clicks drains without an LLM 429~~ — **done 2026-11-22**: 3 clicks in
+     4.6 s, all `COMPLETED`, 0 LLM 429s, drained in 97 s (`burst_evaluation.md`). Live RPM pacing
+     with ≥ 5 clicks would need more daily budget (optional);
+   - ~~latency for a video near the 20-minute cap~~ — **measured 2026-11-22**: 267.6 s for 19:16,
+     including 240.3 s of 503 backoff (see §3);
+   - one multi-chunk transcript (merge request) — **not exercised live** (1 chunk at 19:16). It is
+     covered by automated tests; a live run would need a temporarily lower `TRANSCRIPT_CHUNK_TOKENS`
+     (requires approval).
+4. Optional (not mandatory): Notion-side token revocation, a popup "clear finished jobs" action.
 
 ## 10. Session history (most recent first)
 
 | Date | Session log | Outcome |
 |---|---|---|
+| 2026-11-22 | `spec_compliance_review.md` | Spec §1–§9 checked item by item against code, tests and live evidence. **No mandatory requirement is missing.** Gaps documented (live 429 for YouTube/Notion via tests only; chunk-and-merge tests only; live RPM pacing tests only; README not tried on a clean machine). Backend **951 passed**, extension **94 passed**. New deliverable `docs/SPEC_COMPLIANCE.md`; README links updated |
+| 2026-11-22 | `extension_503_ui_verification.md` | **Inspection only.** Traced the 503 path (worker → `GET /jobs` → `sanitizeStatus` → `describeJob`). A 503 is never shown as a permanent failure (waiting: "Still processing"; after exhausted retries: "temporarily unavailable … Please try again later"). Extension tests 94/94, both 503 views covered. Real gateway responses of two 503-dead-lettered jobs render correctly (Node). Not seen in Chrome. Minor gaps noted (no next-retry time, attempt wording, no single chained test) |
+| 2026-11-22 | `burst_evaluation_preflight.md`, `burst_evaluation.md` | **R9 burst passed (3 clicks).** The preflight recommended 3 (8/16 budget, frequent 503s). Jobs `98d54889`, `37cb68ab`, `c35f1c13` submitted within 4.6 s; the 3rd queued 15 s; all `COMPLETED`, 3 Notion pages, 0 warnings; **0 LLM 429s**; one real 503 (60 s backoff); drained in 97 s; 4 Gemini requests (limiter 8 → 12). RPM pacing not triggered (≤ 3 per 60 s). No config change |
+| 2026-11-22 | `latency_evaluation_near_cap.md` | **Latency evaluation (Option A, no config change).** `favi7avxIag` was rejected (15:32). `rdb2ki4iGuo` (19:16, checked with 1 yt-dlp metadata request); the user clicked once. Job `b3a24d11` was `COMPLETED` in **267.6 s**, of which 240.3 s was backoff after **two real Gemini 503s** (≈ 27.3 s processing, derived). English manual transcript, 612 segments, 8,801 estimated tokens, so **1 chunk, no merge** (merge path stays tests-only). 3 Gemini requests (limiter 5 → 8), 4/4 frames, 1 Notion page, 0 warnings. No other job; services unchanged |
+| 2026-11-22 | `status_doc_cleanup_after_demos.md` | **Docs only.** Stale §3 rows corrected: graceful degradation live-verified (4/7, 0/4 text-only); failure demos all deployed and rehearsed; DLQ count 3 → 5. §8.1 updated (`COMPLETED_WITH_WARNINGS` and crash-during-frames no-duplicate live-verified; crash-during-publishing tests only; merge path and burst still Unverified). Runbook §6 "remaining" corrected. No system change |
+| 2026-11-22 | `gemini_429_once_demo.md` | **Gemini 429 live demo (5-L).** The user clicked once; job `6649512b` was bound. Exactly 1 simulated 429 (no Google call) → `GEMINI_RATE_LIMITED`, shared 20 s cooldown, retry after 20 s through the limiter. **The next real request got a real Gemini 503** (ADR-21, 180 s backoff); the following one succeeded. `COMPLETED` (attempts 2, frames 4/4), exactly 1 Notion page, 0 warnings; limiter 2 → 5/16. Switch off; both workers healthy; other services unchanged. **All live failure demos are complete** |
+| 2026-11-22 | `frames_all_demo.md` | **`frames_all` live demo (3-L) passed.** Switch on for the workers only (`MAX_ATTEMPTS=5`); armed `TlHvYWVUZyc`; the user clicked once. Job `74779edd` was bound and ended `COMPLETED_WITH_WARNINGS` in 12.6 s: frames 4 requested / 0 published, 4 `DEMO_INJECTED_FAILURE` warnings, 1 Gemini request (limiter 2/16), **text-only Notion page** (0 uploads). Switch off again; both workers healthy; other services unchanged. Found a pre-existing, harmless `settle()` TTL quirk on the TPM key (not changed) |
+| 2026-11-22 | `frames_partial_demo.md` | **`frames_partial` live demo (3-L) passed.** Preflight OK; switch on for the workers only (`MAX_ATTEMPTS=5`); armed `M988_fsOSWo`; the user clicked once. Job `82c49d33` was bound immediately and ended `COMPLETED_WITH_WARNINGS` 15 s later: 7 frames requested / 4 published, 3 `DEMO_INJECTED_FAILURE` warnings (frames 1, 3, 5), 1 Gemini request (limiter 1/16), 1 Notion page. Switch off again (`false`, 5); both workers healthy; other services unchanged |
+| 2026-11-22 | `deployment_adr23_workers.md` | ADR-23 deployed to **workers only** (`36c573002412`, rollback tag `pre-adr23-workers` = `78864607bddd`); both healthy; namespace empty (original keys), switch off, `MAX_ATTEMPTS=5`; `/healthz` 2 workers; other services identical to baseline; `rpd:2026-11-21` still 16; no key switch, no jobs, no external calls |
+| 2026-11-22 | `adr23_gemini_limiter_namespace.md` | **ADR-23 implemented:** `GEMINI_LIMITER_NAMESPACE` (workers; empty = original keys byte-for-byte; `alt` namespaces the four Gemini keys only). 28 new tests; backend **951 passed**, 0 failed. Worker image `36c573002412` built and verified; rollback tag `pre-adr23-workers` = `78864607bddd`; dry run shows only the workers. **Not deployed**; no `.env` access, no jobs, no external calls |
+| 2026-11-22 | `dlq_demo_rehearsal_success.md` | **DLQ live demo (2-L) passed.** Preflight was read-only; then switch on with `MAX_ATTEMPTS=3`, workers only; armed `dlq` for `favi7avxIag`; the user clicked once. Job `129af1de` was bound immediately and reached `DEAD_LETTERED` (3 attempts, `YOUTUBE_UNREACHABLE`) 41 s later. `jobs.dlq` went from 4 to 5; 0 external calls; Gemini counter still 16. Then disabled (`false`, 5); both workers healthy; no other jobs |
+| 2026-11-22 | `job_44df00c0_origin_investigation.md` | Read-only. `44df00c0` was one of **4 extension Take Notes submissions within 7 s** (21:27 UTC, one host browser connection, not Claude). Outcomes: 3 `COMPLETED`; `44df00c0` real Gemini 503, then local daily limit → `DEAD_LETTERED`. Those 4 requests took the counter 12 → 16. Nothing deleted; limiter untouched; no jobs submitted |
+| 2026-11-22 | `deployment_adr22_workers.md` | ADR-22 deployed to **workers only** (`78864607bddd`, rollback tag `pre-adr22-workers`); both healthy, `DEMO_FAULTS_ENABLED=false` on both; other services untouched; noted: `jobs.dlq` 4 (job `44df00c0`, 21:31 UTC, local `GEMINI_DAILY_LIMIT_REACHED`, before deploy); limiter Gemini counter 16/16 |
+| 2026-11-22 | `demo_fault_switch_implementation.md` | **ADR-22 implemented:** demo fault switch (`dlq`, `gemini_429_once`, `frames_partial`, `frames_all`), off by default, one-shot arming CLI, fail-safe; 21 new tests; backend **923 passed**, extension 94 passed; not deployed, not rehearsed |
+| 2026-11-22 | `demo_fault_switch_design.md` | Investigation + design of a disabled-by-default demo fault switch (DLQ / Gemini 429 once / partial frames) that reuses the production error paths; files, safety controls and test plan listed; **not implemented**, awaiting review |
+| 2026-11-22 | `crash_recovery_rehearsal_success.md` | **Crash recovery rehearsed live:** user's one Take Notes job `6141336d` (`fyTxwIa-1U0`); `worker-2` SIGKILLed in EXTRACTING_FRAMES; `worker-1` resumed (redelivered) and completed it in 10.6 s, 5/5 frames, `attempts` 0; exactly one Notion page request; workers restored (same containers), all services untouched |
+| 2026-11-22 | `scaling_rehearsal_success.md` | **Scaling rehearsal succeeded:** worker 2 → 3 (healthy in about 2 s; `live_workers` 3; 3 consumers) → 2 (`live_workers` 2 after about 3 s); all other containers and workers 1/2 identical to the baseline; no jobs, 0 errors |
+| 2026-11-22 | `scaling_rehearsal_stopped_dry_run.md` | Scaling rehearsal stopped before any change: the documented bare `docker compose up -d --scale worker=3` would have recreated the gateway, publisher and migrate (`:dev` tag ≠ their running image). Runbook and README corrected to `--no-deps --scale worker=N worker` (dry-run: only worker-3 created); stack unchanged |
+| 2026-11-22 | `failure_demo_runbook_preparation.md` | `docs/FAILURE_DEMONSTRATION_RUNBOOK.md` written (spec §6 + scaling): automated proofs ready for all five (22 tests, collect-only verified); live-ready: crash recovery, scaling; live gaps: 429, frame failure, spec DLQ hint vs D-1; nothing executed |
+| 2026-11-21/22 | `readme_and_status_recovery.md` | Context recovered after the Copilot sessions; root `README.md` written (spec §8) and verified against Compose; user-reported manual tests recorded (normal run published to Notion, > 20 min rejected, no-captions rejected); extension 94/94; backend 896 + 6 re-run = all 902 passed (6 timeouts during host suspension) |
 | 2026-11-21 | `first_real_e2e_test_flash_lite.md` | One 2:33 video job: 39 transcript segments, one structured Flash-Lite request, 4/4 validated frames; failed at PUBLISHING with `NOTION_OBJECT_NOT_FOUND`; no page result and no retry |
 | 2026-11-21 | `gemini_35_flash_lite_production_switch.md` | Pinned Flash-Lite in worker Compose and app defaults; rebuilt/recreated only two workers; both healthy and verified loading the model; 71 focused offline tests passed; no live Gemini request |
 | 2026-11-21 | `gemini_35_flash_lite_structured_summarization_test.md` | One-chunk production stage test on the 3-segment contract fixture: limiter allowed one request; HTTP 200 in 1.381 s; schema/normalization and grounded section/moment timestamps passed; multi-chunk behavior unverified; no migration |

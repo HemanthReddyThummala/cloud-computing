@@ -178,13 +178,21 @@ class RateLimiter:
         self._settle = redis.register_script(_SETTLE)
 
     # ------------------------------------------------------------ keys
-    @staticmethod
-    def cooldown_key(provider: Provider) -> str:
-        return f"{KEY_PREFIX}:cooldown:{provider.value.lower()}"
+    @property
+    def _gemini_name(self) -> str:
+        """``gemini``, or ``gemini-<namespace>`` (ADR-23: one set of counters per Google Cloud project).
+        The default empty namespace keeps the original key names byte-for-byte."""
+        namespace = self.settings.gemini_limiter_namespace
+        return f"gemini-{namespace}" if namespace else "gemini"
+
+    def cooldown_key(self, provider: Provider) -> str:
+        provider = Provider(provider)
+        name = self._gemini_name if provider is Provider.GEMINI else provider.value.lower()
+        return f"{KEY_PREFIX}:cooldown:{name}"
 
     def _gemini_keys(self, now: datetime) -> list[str]:
-        return [self.cooldown_key(Provider.GEMINI), f"{KEY_PREFIX}:gemini:rpm", f"{KEY_PREFIX}:gemini:tpm",
-                f"{KEY_PREFIX}:gemini:rpd:{pacific_day(now)}"]
+        base = f"{KEY_PREFIX}:{self._gemini_name}"
+        return [self.cooldown_key(Provider.GEMINI), f"{base}:rpm", f"{base}:tpm", f"{base}:rpd:{pacific_day(now)}"]
 
     # ------------------------------------------------------------ acquire
     async def acquire(self, provider: Provider, *, tokens: int = 0, connection: str = "default",
@@ -246,7 +254,7 @@ class RateLimiter:
         if permit.provider is not Provider.GEMINI or actual_tokens == permit.tokens or permit.tokens <= 0:
             return
         try:
-            await self._settle(keys=[f"{KEY_PREFIX}:gemini:tpm"],
+            await self._settle(keys=[f"{KEY_PREFIX}:{self._gemini_name}:tpm"],
                                args=[f"{permit.reservation}:{permit.tokens}",
                                      f"{permit.reservation}:{max(0, int(actual_tokens))}"])
         except (RedisError, OSError, asyncio.TimeoutError) as exc:

@@ -43,6 +43,7 @@ from typing import Any
 
 from notesagent.common.config import Settings
 from notesagent.common.errors import FatalStageError, PipelineError, Provider, RateLimited
+from notesagent.worker.demo_faults import FRAME_FAILURE_REASON
 from notesagent.worker.stages import StageContext, StageOutput
 from notesagent.worker.youtube import YouTubeClient, classify_metadata_error
 
@@ -224,6 +225,8 @@ def make_frames_stage(settings: Settings, client: Any | None = None):
             return _output(base, [], failed, None)
 
         duration = await asyncio.to_thread(probe_duration, source["path"]) or source.get("duration")
+        demo = ctx.demo_faults                                     # ADR-22 (None unless enabled)
+        demo_scenario = await demo.scenario(ctx.job_id) if demo is not None else None
         frames, failed = [], []
         for index, moment in enumerate(moments):
             t = valid_timestamp(moment.get("timestamp_sec"), duration)
@@ -232,6 +235,8 @@ def make_frames_stage(settings: Settings, client: Any | None = None):
                 continue
             out = str(Path(workdir) / f"frame-{index:02d}.jpg")
             try:
+                if demo is not None and demo.frame_injected(ctx, demo_scenario, index):
+                    raise FrameError(FRAME_FAILURE_REASON)           # INSTEAD of FFmpeg for this frame
                 width, height = await asyncio.to_thread(
                     extract_frame, source["path"], t, out, max_width=settings.frame_max_width,
                     quality=settings.frame_jpeg_quality, timeout=settings.frame_ffmpeg_timeout_sec)

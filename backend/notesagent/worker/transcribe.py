@@ -93,16 +93,22 @@ def to_segments(snippets: Iterable[Any]) -> list[dict[str, Any]]:
 def make_transcribe_stage(settings: Settings, client: Any | None = None):
     youtube = client or YouTubeClient(timeout_sec=settings.youtube_request_timeout_sec)
 
-    async def call(ctx: StageContext, classify, fn, *args):
+    async def call(ctx: StageContext, classify, fn, *args, demo_hook=None):
         await ctx.limiter.acquire(Provider.YOUTUBE)          # shared limiter BEFORE every YouTube request
         try:
+            if demo_hook is not None:                        # ADR-22: may raise INSTEAD of the request
+                await demo_hook(ctx)
             return await asyncio.to_thread(fn, *args)
         except Exception as exc:  # noqa: BLE001 - classified; upstream text is never kept
             raise classify(exc) from None
 
     async def transcribe(ctx: StageContext) -> StageOutput:
         video_id = ctx.job["video_id"]
-        info = await call(ctx, classify_metadata_error, youtube.video_info, video_id)
+        hook = None
+        if ctx.demo_faults is not None:                      # ADR-22 (disabled by default)
+            await ctx.demo_faults.bind(ctx)
+            hook = ctx.demo_faults.before_youtube_metadata
+        info = await call(ctx, classify_metadata_error, youtube.video_info, video_id, demo_hook=hook)
         if not isinstance(info, dict):
             raise FatalStageError("VIDEO_DURATION_UNKNOWN", "The video's metadata could not be read.")
         duration = check_duration(info.get("duration"), settings.max_video_duration_sec)   # before the transcript

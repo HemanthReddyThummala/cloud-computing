@@ -13,6 +13,9 @@ import uuid
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# ADR-23: empty, or a short lowercase label used inside Redis key names.
+_LIMITER_NAMESPACE = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)?")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
@@ -56,6 +59,10 @@ class Settings(BaseSettings):
     outbox_poll_interval_ms: int = Field(1000, ge=50)
     outbox_heartbeat_file: str = "/tmp/outbox-heartbeat"
 
+    # ADR-22 demo fault switch for live failure demonstrations. MUST stay false in normal operation; even
+    # when true, a fault only happens for a video an operator explicitly armed via the worker CLI.
+    demo_faults_enabled: bool = False
+
     # Workers
     worker_id: str = ""
     worker_heartbeat_ttl_sec: int = Field(15, ge=5)
@@ -70,6 +77,9 @@ class Settings(BaseSettings):
     gemini_rpm_limit: int = Field(4, ge=1)
     gemini_tpm_limit: int = Field(200_000, ge=1)
     gemini_rpd_limit: int = Field(16, ge=1)
+    # ADR-23: separate Gemini limiter counters per Google Cloud project (quotas are per project). Empty
+    # (default) keeps the original key names byte-for-byte; e.g. "alt" -> ratelimit:gemini-alt:rpm, ...
+    gemini_limiter_namespace: str = ""
     notion_rps_limit: float = Field(2.5, gt=0, le=100)
     # Longest a worker waits in-process for the limiter; longer waits re-queue the job (ADR-11).
     rate_limit_max_wait_sec: float = Field(60.0, ge=0, le=600)
@@ -189,6 +199,15 @@ class Settings(BaseSettings):
         if value.strip().lower() not in {"minimal", "low", "medium", "high"}:
             raise ValueError("must be one of minimal, low, medium, high")
         return value.strip().lower()
+
+    @field_validator("gemini_limiter_namespace", mode="before")
+    @classmethod
+    def _valid_limiter_namespace(cls, value: object) -> str:
+        text = "" if value is None else str(value).strip()
+        if not _LIMITER_NAMESPACE.fullmatch(text):
+            raise ValueError("must be empty or 1-32 characters a-z, 0-9 and '-', starting and ending with a "
+                             "letter or digit (e.g. alt)")
+        return text
 
     @field_validator("gemini_model")
     @classmethod

@@ -39,6 +39,8 @@ class StageContext:
     # Shared rate limiter (ADR-13). Every external call must first obtain a permit:
     #   await ctx.limiter.acquire(Provider.GEMINI, tokens=...)
     limiter: Any = None
+    # ADR-22 demo fault switch: a DemoFaults object ONLY when DEMO_FAULTS_ENABLED=true, otherwise None.
+    demo_faults: Any = None
 
     async def get_notion_token(self) -> str:
         """Decrypt the token from the credential mailbox (non-consuming read)."""

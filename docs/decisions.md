@@ -701,3 +701,100 @@ why, and what it does **not** guarantee.
 **Not changed:** the model, the key, the free-tier limits, the request content, the job state machine.
 These changes do not make Gemini answer while it reports `UNAVAILABLE`; they make such episodes
 visible, survivable for longer and cheaper in quota.
+
+## ADR-22 Demo fault switch for live failure demonstrations (spec §6) (2026-11-22)
+
+**Context:** spec §6 requires live, grader-triggerable demonstrations of DLQ, graceful frame degradation and
+HTTP 429 handling. Real 429s or frame failures cannot be produced safely on demand. The spec's DLQ hint
+(a private video) ends `FAILED` because of ADR-14 D-1, which must not change.
+
+**Decision:** one disabled-by-default switch with four scenarios. Each raises, at the existing
+provider/stage boundary and **instead of** the external call, the **same exception type a real failure
+produces**. Everything after the raise is unmodified production code (classification, retries, cooldown,
+warnings, publishing, DLQ).
+
+| Scenario | Hook | Injected | Resulting production path |
+|---|---|---|---|
+| `dlq` | `transcribe.call()`, first (metadata) YouTube request, every attempt | `yt_dlp…TransportError` | `classify_metadata_error` → `TransientError YOUTUBE_UNREACHABLE` → retries → `DEAD_LETTERED` + `jobs.dlq`; YouTube never contacted |
+| `gemini_429_once` | `summarize.ask()`, after the limiter permit, instead of `generate()`; at most once per job (Redis `SET NX` marker) | `google.genai.errors.ClientError(429, RetryInfo 20s)` | `classify_gemini_error` → `RateLimited GEMINI_RATE_LIMITED` → shared cooldown + 20 s delay → the next attempt makes the one real request |
+| `frames_partial` | `frames._extract_into` loop, odd indices (index 0 always real) | `FrameError("DEMO_INJECTED_FAILURE")` | `FRAME_EXTRACTION_FAILED` warnings → `COMPLETED_WITH_WARNINGS`, page with the remaining frames |
+| `frames_all` | same loop, every index | same | `COMPLETED_WITH_WARNINGS`, **text-only page** |
+
+**Safety:**
+- **Gate 1:** `DEMO_FAULTS_ENABLED` (worker only, default false). When false, the runner passes
+  `StageContext.demo_faults = None`, the hooks are inert and no Redis key is read.
+- **Gate 2:** an operator arms one video:
+  `docker compose exec worker python -m notesagent.ops.demo_faults arm <scenario> --video <id>`. It
+  refuses unless the switch is on in that container. Redis `demo:fault:video:<id>`, TTL 15 min.
+- **One job:** at the start of TRANSCRIBING, `GETDEL` claims the arming atomically and binds it to
+  `demo:fault:job:<job_id>` (TTL 2 h). It is kept across that job's retries; other jobs (including a
+  second job for the same video) are unaffected.
+- **No external trigger:** the gateway schema forbids extra fields, there is no route, and Redis is not
+  published.
+- **Fail-safe:** any Redis error → no fault.
+- **Visible:** every binding and injection logs `demo fault injected` (scenario, job, stage, attempt).
+- **D-1 unchanged:** private/unavailable videos still end `FAILED`.
+
+The unused `CHAOS_ENABLED` placeholder was removed from `.env.example`.
+
+## ADR-23 Per-project Gemini limiter namespace (`GEMINI_LIMITER_NAMESPACE`) (2026-11-22)
+
+**Context:**
+- Gemini quotas (RPM, TPM, RPD) belong to a Google Cloud project.
+- The ADR-13 limiter used fixed Redis keys: `ratelimit:gemini:rpm`, `ratelimit:gemini:tpm`,
+  `ratelimit:gemini:rpd:<Pacific day>` and `ratelimit:cooldown:gemini`. Nothing in the key names
+  identified a project.
+- Changing only `GEMINI_API_KEY` to a key from another project would therefore keep charging the
+  original project's counters. If that counter is exhausted (16/16), every request is refused locally.
+  A 429 from one project would also cool down the other.
+- Resetting or deleting counters, or raising `GEMINI_RPD_LIMIT`, would weaken the limiter and is not
+  allowed.
+- A separate Redis database for the workers would split the worker heartbeats (`/healthz`) and the
+  Notion limiter state from the gateway's.
+
+**Decision:**
+- New optional worker setting `GEMINI_LIMITER_NAMESPACE`, default **empty**.
+- **Empty:** every key name stays **byte-for-byte** as before, so the existing counters remain valid.
+- **Non-empty** (e.g. `alt`): only the four Gemini keys change.
+
+  | Key | With `alt` |
+  |---|---|
+  | Requests per minute | `ratelimit:gemini-alt:rpm` |
+  | Tokens per minute | `ratelimit:gemini-alt:tpm` (also used by `settle()`) |
+  | Requests per day | `ratelimit:gemini-alt:rpd:<Pacific day>` |
+  | Cooldown | `ratelimit:cooldown:gemini-alt` |
+
+- **Unchanged:**
+  - Notion (`ratelimit:cooldown:notion`, `ratelimit:notion:next:<conn>`) and YouTube
+    (`ratelimit:cooldown:youtube`) keys; they are not per Gemini project;
+  - the Lua scripts, the atomicity, Redis' clock, the Pacific day calculation and the configured
+    limits;
+  - all workers that use the same namespace share one budget.
+- **Validation:** empty, or 1–32 characters `a-z`, `0-9`, `-`, starting and ending with a letter or
+  digit (surrounding whitespace is stripped). Anything else fails at startup. This prevents `:` from
+  creating colliding or confusing key names.
+- **Visibility:** the worker's "worker started" log includes `gemini_limiter_namespace` (the label or
+  `(default)`), never the key.
+- **Operation:**
+  - the alternate key and namespace live in a separate git-ignored file (`.env.gemini-alt`, covered by
+    `.env.*`), created by the operator;
+  - it is layered for the workers only with
+    `docker compose --env-file .env --env-file .env.gemini-alt up -d --no-deps --no-build --scale worker=2 worker`;
+  - the plain command without `--env-file` switches back.
+  - `.env` is not modified.
+
+**Consequences:**
+- The limiter enforces each project's own quota correctly.
+- Counters of an unused namespace expire on their own: `rpd` about 1–2 days, windows 2 minutes,
+  cooldowns at their end.
+- **Operator responsibility:** a namespace is only correct if it is paired with that project's key.
+  The limiter cannot verify which project a key belongs to, and keys are never printed or hashed for
+  display.
+- The gateway does not use Gemini, so it does not receive the setting.
+
+**Tests:** `backend/tests/test_limiter_namespace.py` (28) covers:
+- default compatibility (key names, and the real keys written in Redis);
+- RPD / RPM / TPM isolation;
+- cooldown isolation in both directions, with Notion still shared;
+- an atomic, shared namespaced RPD across three independent processes;
+- invalid and valid values.

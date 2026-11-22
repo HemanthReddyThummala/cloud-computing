@@ -220,6 +220,8 @@ def make_summarize_stage(settings: Settings, client: Any | None = None):
         tokens = estimate_tokens(system) + estimate_tokens(prompt) + estimate_tokens(json.dumps(schema))
         permit = await ctx.limiter.acquire(Provider.GEMINI, tokens=tokens)    # BEFORE every request
         try:
+            if ctx.demo_faults is not None:                  # ADR-22: may raise a 429 INSTEAD of the request
+                await ctx.demo_faults.before_gemini_request(ctx)
             reply = await gemini.generate(system=system, prompt=prompt, schema=schema)
         except Exception as exc:  # noqa: BLE001 - classified; upstream text is never kept
             raise classify_gemini_error(exc) from None
